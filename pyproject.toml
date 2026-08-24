@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wch-ota"
+version = "0.1.0"
+description = "WCH BLE OTA desktop tool"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6-Essentials>=6.6",
+    "bleak>=0.22",
+    "qasync>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "pytest-qt>=4.4",
+    "pyinstaller>=6",
+]
+
+[project.scripts]
+wch-ota = "wch_ota.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+qt_api = "pyside6"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"wch_ota.ble" = ["WCHBLEDLL*.dll"]
