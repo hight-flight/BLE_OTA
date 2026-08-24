@@ -21,6 +21,7 @@ class ImageType(Enum):
 
     A = "A"
     B = "B"
+    IAP = "IAP"
     UNKNOWN = "UNKNOWN"
 
 

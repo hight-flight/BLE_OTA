@@ -54,6 +54,16 @@ def test_erase_command_encodes_target_image_a_in_seventh_byte() -> None:
     )
 
 
+def test_erase_command_encodes_target_image_iap_in_seventh_byte() -> None:
+    command = build_erase_command(
+        0, 111, ChipType.CH583, target_image=ImageType.IAP
+    )
+
+    assert command == bytes.fromhex(
+        "81 00 00 00 6F 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00"
+    )
+
+
 def test_compact_erase_command_matches_wch_pc_reference_tool() -> None:
     assert build_compact_erase_command(0x1000, 50, ChipType.CH583) == bytes.fromhex(
         "81 04 00 01 32 00"

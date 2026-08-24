@@ -153,6 +153,7 @@ class OtaController:
             raise OtaError("固件数据不能为空")
         if (
             info.chip is not ChipType.CH579
+            and info.image in {ImageType.A, ImageType.B}
             and info.offset > 0
             and len(firmware.data) > info.offset
         ):
@@ -185,8 +186,10 @@ class OtaController:
 
     @staticmethod
     def _target_address(firmware: FirmwareImage, info: CurrentImageInfo) -> int:
-        if info.image not in {ImageType.A, ImageType.B}:
+        if info.image not in {ImageType.A, ImageType.B, ImageType.IAP}:
             raise OtaError("设备当前 Image 类型无效")
+        if info.image is ImageType.IAP and info.chip is ChipType.CH579:
+            raise OtaError("CH579 不支持 Image IAP 升级")
         if info.chip is not ChipType.CH579:
             return firmware.start_address
         if info.image is ImageType.A:
@@ -222,12 +225,14 @@ class OtaController:
             info.chip,
             target_image=info.image,
         )
-        compact_command = build_compact_erase_command(
-            start_address, block_count, info.chip
+        compact_command = (
+            None
+            if info.image is ImageType.IAP
+            else build_compact_erase_command(start_address, block_count, info.chip)
         )
         prefer_compact = bool(
             getattr(self._transport, "prefer_compact_erase", False)
-        )
+        ) and compact_command is not None
         command = compact_command if prefer_compact else android_command
         fallback_command = android_command if prefer_compact else compact_command
         fallback_label = "Android 备用帧" if prefer_compact else "兼容帧"
@@ -258,23 +263,24 @@ class OtaController:
                             message="无响应擦除未返回状态，已改用有响应写入擦除成功",
                         )
                         return False
-                fallback_response = await self._send_erase_and_read(fallback_command)
-                fallback_rx = fallback_response.hex(" ").upper() or "空"
-                compatibility = (
-                    f"；{fallback_label}TX={fallback_command.hex(' ').upper()}；"
-                    f"{fallback_label}RX={fallback_rx}"
-                )
-                if is_erase_success(fallback_response):
-                    fallback_description = (
-                        "Android 20 字节备用帧"
-                        if prefer_compact
-                        else "6 字节兼容帧"
+                if fallback_command is not None:
+                    fallback_response = await self._send_erase_and_read(fallback_command)
+                    fallback_rx = fallback_response.hex(" ").upper() or "空"
+                    compatibility = (
+                        f"；{fallback_label}TX={fallback_command.hex(' ').upper()}；"
+                        f"{fallback_label}RX={fallback_rx}"
                     )
-                    self._emit(
-                        UpgradeStatus.RUNNING,
-                        message=f"主擦除帧无响应，已使用{fallback_description}擦除成功",
-                    )
-                    return False
+                    if is_erase_success(fallback_response):
+                        fallback_description = (
+                            "Android 20 字节备用帧"
+                            if prefer_compact
+                            else "6 字节兼容帧"
+                        )
+                        self._emit(
+                            UpgradeStatus.RUNNING,
+                            message=f"主擦除帧无响应，已使用{fallback_description}擦除成功",
+                        )
+                        return False
         if not is_erase_success(response):
             rx = bytes(response or b"").hex(" ").upper() or "空"
             status = f"状态 0x{response[0]:02X}" if response else "无有效状态"

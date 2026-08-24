@@ -411,6 +411,45 @@ async def test_upgrade_rejects_firmware_larger_than_target_image() -> None:
     assert events[-1].status is UpgradeStatus.FAILED
 
 
+def test_iap_preflight_uses_manual_address_without_ab_capacity_limit() -> None:
+    controller = OtaController(FakeTransport(), sleep=no_sleep)
+    firmware = FirmwareImage(0x1000, bytes(17))
+    info = CurrentImageInfo(ChipType.CH583, ImageType.IAP, 16, 16)
+
+    start_address = controller._target_address(firmware, info)
+
+    assert start_address == 0x1000
+    assert controller._preflight(firmware, info, start_address) == 2
+
+
+def test_ch579_rejects_iap_target() -> None:
+    controller = OtaController(FakeTransport(), sleep=no_sleep)
+    info = CurrentImageInfo(ChipType.CH579, ImageType.IAP, 0x1200, 256)
+
+    with pytest.raises(OtaError, match="CH579.*IAP"):
+        controller._target_address(FirmwareImage(0, bytes(16)), info)
+
+
+@pytest.mark.asyncio
+async def test_iap_erase_failure_never_falls_back_to_frame_without_image_flag() -> None:
+    transport = FakeTransport(
+        responses=[b""] * 12 + [info_response(block_size=16)] + [b""] * 11,
+        mtu=247,
+    )
+    info = CurrentImageInfo(ChipType.CH583, ImageType.IAP, 16, 16)
+
+    with pytest.raises(OtaError, match="擦除失败"):
+        await OtaController(transport, sleep=no_sleep).upgrade(
+            FirmwareImage(0, bytes(17)), info
+        )
+
+    assert transport.writes == [
+        build_info_command(),
+        build_erase_command(0, 2, ChipType.CH583, target_image=ImageType.IAP),
+        build_info_command(),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_upgrade_rejects_start_address_not_aligned_to_erase_block() -> None:
     transport = FakeTransport()

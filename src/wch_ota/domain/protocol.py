@@ -36,9 +36,13 @@ def build_erase_command(
     if not 0 <= block <= 0xFFFF:
         raise ValueError("block must fit in an unsigned 16-bit value")
     try:
-        image_value = {ImageType.B: 0, ImageType.A: 1}[target_image]
+        image_value = {
+            ImageType.B: 0,
+            ImageType.A: 1,
+            ImageType.IAP: 2,
+        }[target_image]
     except KeyError as error:
-        raise ValueError("target image must be Image A or Image B") from error
+        raise ValueError("target image must be Image A, Image B or Image IAP") from error
     return bytes([
         _ERASE,
         0,

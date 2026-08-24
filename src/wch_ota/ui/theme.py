@@ -78,6 +78,23 @@ QPushButton[compact="true"] {
     padding-right: 7px;
 }
 
+QPushButton[targetImageButton="true"]:checked {
+    color: #FFFFFF;
+    background-color: #0078D4;
+    border-color: #006FBE;
+    font-weight: 600;
+}
+
+QPushButton[targetImageButton="true"]:checked:hover {
+    background-color: #1689DB;
+}
+
+QPushButton[targetImageButton="true"]:checked:disabled {
+    color: #FFFFFF;
+    background-color: #7FAED3;
+    border-color: #7FAED3;
+}
+
 QPushButton[actionButton="true"] {
     min-height: 20px;
     padding: 0 5px;

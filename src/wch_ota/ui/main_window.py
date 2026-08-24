@@ -44,6 +44,8 @@ class MainWindow(QMainWindow):
         self.current_info = None
         self._connected = bool(transport.is_connected)
         self._connected_address = ""
+        self._active_device: Any | None = None
+        self._last_verified_device: Any | None = None
         self._scanning = False
         self._upgrading = False
         self._connection_busy = False
@@ -128,6 +130,8 @@ class MainWindow(QMainWindow):
         self.disconnect_button = QPushButton("断开", self)
         self.connect_button.hide()
         self.disconnect_button.hide()
+        self.reconnect_button = QPushButton("重新连接")
+        self.reconnect_button.hide()
         self.info_button = QPushButton("获取信息")
         self.connect_button.setProperty("buttonRole", "primary")
 
@@ -148,6 +152,7 @@ class MainWindow(QMainWindow):
         info_form.addRow("块大小", self.block_label)
         info_actions = QHBoxLayout()
         info_actions.addStretch(1)
+        info_actions.addWidget(self.reconnect_button)
         info_actions.addWidget(self.info_button)
         info_layout.addLayout(info_form)
         info_layout.addLayout(info_actions)
@@ -156,6 +161,9 @@ class MainWindow(QMainWindow):
         self.firmware_path = self.firmware_panel.path_edit
         self.browse_button = self.firmware_panel.browse_button
         self.erase_address = self.firmware_panel.erase_address
+        self.image_a_button = self.firmware_panel.image_a_button
+        self.image_b_button = self.firmware_panel.image_b_button
+        self.image_iap_button = self.firmware_panel.image_iap_button
         self.start_button = QPushButton("开始升级")
         self.cancel_button = QPushButton("取消")
         self.start_button.setProperty("buttonRole", "primary")
@@ -228,9 +236,16 @@ class MainWindow(QMainWindow):
         self.scan_button.clicked.connect(self._scan_slot)
         self.connect_button.clicked.connect(self._connect_slot)
         self.disconnect_button.clicked.connect(self._disconnect_slot)
+        self.reconnect_button.clicked.connect(self._reconnect_slot)
         self.info_button.clicked.connect(self._info_slot)
         self.browse_button.clicked.connect(self.browse_firmware)
         self.erase_address.editingFinished.connect(self._validate_firmware)
+        for image_button in (
+            self.image_a_button,
+            self.image_b_button,
+            self.image_iap_button,
+        ):
+            image_button.clicked.connect(self._on_target_image_changed)
         self.start_button.clicked.connect(self._upgrade_slot)
         self.cancel_button.clicked.connect(self.cancel_upgrade)
         self.export_button.clicked.connect(self.export_logs)
@@ -253,6 +268,10 @@ class MainWindow(QMainWindow):
     @asyncSlot()
     async def _disconnect_slot(self) -> None:
         await self.disconnect()
+
+    @asyncSlot()
+    async def _reconnect_slot(self) -> None:
+        await self.reconnect_last_device()
 
     @asyncSlot()
     async def _info_slot(self) -> None:
@@ -363,6 +382,22 @@ class MainWindow(QMainWindow):
             return
         source_index = self.device_proxy.mapToSource(indexes[0])
         device = self.device_model.device_at(source_index.row())
+        await self._connect_device(device, reconnecting=False)
+
+    async def reconnect_last_device(self) -> None:
+        if self._connection_lock.locked():
+            self._append_log("连接操作正在进行中")
+            return
+        if self._connected or self.transport.is_connected:
+            self._set_connected(True)
+            self._append_log("设备已经连接")
+            return
+        if self._last_verified_device is None:
+            self._append_log("没有可重新连接的设备")
+            return
+        await self._connect_device(self._last_verified_device, reconnecting=True)
+
+    async def _connect_device(self, device: Any, *, reconnecting: bool) -> None:
         async with self._connection_lock:
             self._connection_busy = True
             self._refresh_controls()
@@ -370,11 +405,14 @@ class MainWindow(QMainWindow):
             try:
                 await self.transport.stop_scan()
                 self._set_scanning(False)
-                self._append_log(f"正在连接：{getattr(device, 'address', '')}")
+                action = "正在重新连接" if reconnecting else "正在连接"
+                self._append_log(f"{action}：{getattr(device, 'address', '')}")
                 await self.transport.connect(device)
+                self._active_device = device
                 self._connected_address = str(getattr(device, "address", ""))
                 self._set_connected(True)
-                self._append_log(f"已连接：{getattr(device, 'address', '')}")
+                result = "重新连接成功" if reconnecting else "已连接"
+                self._append_log(f"{result}：{getattr(device, 'address', '')}")
                 properties = ", ".join(
                     getattr(self.transport, "ota_characteristic_properties", ())
                 )
@@ -429,6 +467,10 @@ class MainWindow(QMainWindow):
         try:
             info = await self.controller.get_current_image_info()
             self._apply_device_info(info)
+            if self._active_device is not None:
+                self._last_verified_device = self._active_device
+                self.reconnect_button.show()
+                self._refresh_controls()
             self._append_log("已读取设备镜像信息")
         except Exception as error:
             self._invalidate_device_info()
@@ -448,7 +490,9 @@ class MainWindow(QMainWindow):
         self.chip_label.setText(info.chip.value)
         self.image_label.setText(info.image.value)
         target_image = _TARGET_IMAGE.get(info.image)
-        self.target_image_label.setText(target_image.value if target_image else "-")
+        if target_image is not None:
+            self.firmware_panel.set_target_image(target_image)
+        self._on_target_image_changed()
         if info.chip is ChipType.CH579:
             self.image_value_title.setText("镜像偏移")
             self.offset_label.setText(f"0x{info.offset:08X}")
@@ -457,6 +501,13 @@ class MainWindow(QMainWindow):
             self.offset_label.setText(f"{info.offset} 字节（0x{info.offset:08X}）")
         self.block_label.setText(f"{info.block_size} 字节")
         self._refresh_controls()
+
+    @Slot()
+    def _on_target_image_changed(self) -> None:
+        target_image = self.firmware_panel.target_image()
+        self.target_image_label.setText(target_image.value)
+        self._firmware_cache_key = None
+        self._validate_firmware()
 
     @Slot()
     def browse_firmware(self) -> None:
@@ -482,6 +533,7 @@ class MainWindow(QMainWindow):
     def _get_validated_firmware(self):
         path = Path(self.firmware_path.text())
         suffix = path.suffix.lower()
+        target_image = self.firmware_panel.target_image()
         erase_address = None
         if suffix == ".bin":
             address = self.erase_address.text()
@@ -492,7 +544,7 @@ class MainWindow(QMainWindow):
             erase_address = int(address, 16)
             if self.current_info is not None and self.current_info.chip is ChipType.CH579:
                 erase_address = 0
-        elif suffix != ".hex":
+        elif suffix != ".hex" or target_image is ImageType.IAP:
             return None
         try:
             stat = path.stat()
@@ -500,7 +552,13 @@ class MainWindow(QMainWindow):
             self._firmware_cache_key = None
             self._firmware_cache = None
             return None
-        key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, erase_address)
+        key = (
+            str(path.resolve()),
+            stat.st_mtime_ns,
+            stat.st_size,
+            erase_address,
+            target_image,
+        )
         if key == self._firmware_cache_key:
             return self._firmware_cache
         try:
@@ -530,9 +588,9 @@ class MainWindow(QMainWindow):
             self._upgrade_task = current_task
             owner = True
             self._set_upgrading(True)
-            target_image = _TARGET_IMAGE.get(self.current_info.image)
-            if target_image is None:
-                raise ValueError("设备当前 Image 类型无效，无法确定升级目标")
+            target_image = self.firmware_panel.target_image()
+            if target_image is ImageType.IAP and self.current_info.chip is ChipType.CH579:
+                raise ValueError("CH579 不支持 Image IAP 升级")
             self._append_log(
                 f"开始升级：{path.name}，{len(firmware.data)} 字节；"
                 f"目标 Image {target_image.value}"
@@ -566,6 +624,7 @@ class MainWindow(QMainWindow):
         if not connected:
             self._invalidate_device_info()
             self._connected_address = ""
+            self._active_device = None
         self._refresh_controls()
 
     def _set_scanning(self, scanning: bool) -> None:
@@ -585,6 +644,9 @@ class MainWindow(QMainWindow):
         self.device_filter.setEnabled(idle and not self._connected)
         self.connect_button.setEnabled(idle and not self._connected and selected)
         self.disconnect_button.setEnabled(idle and self._connected)
+        self.reconnect_button.setEnabled(
+            idle and not self._connected and self._last_verified_device is not None
+        )
         self.info_button.setEnabled(idle and self._connected)
         self._refresh_device_action_widgets()
         self.browse_button.setEnabled(idle)
@@ -595,6 +657,14 @@ class MainWindow(QMainWindow):
                 self.current_info is None
                 or self.current_info.chip is not ChipType.CH579
             )
+        )
+        image_selection_enabled = idle and self._connected
+        self.image_a_button.setEnabled(image_selection_enabled)
+        self.image_b_button.setEnabled(image_selection_enabled)
+        self.image_iap_button.setEnabled(
+            image_selection_enabled
+            and self.current_info is not None
+            and self.current_info.chip is not ChipType.CH579
         )
         self.start_button.setEnabled(idle and self._connected and self._firmware_valid and self.current_info is not None)
         self.cancel_button.setEnabled(self._upgrading)

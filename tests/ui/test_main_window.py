@@ -92,6 +92,8 @@ def test_window_contains_complete_controls_and_initial_state(window):
     assert widget.connect_button.isHidden()
     assert widget.disconnect_button.isHidden()
     assert widget.info_button.text() == "获取信息"
+    assert widget.reconnect_button.text() == "重新连接"
+    assert widget.reconnect_button.isHidden()
     assert widget.firmware_path.isReadOnly()
     assert widget.start_button.text() == "开始升级"
     assert widget.cancel_button.text() == "取消"
@@ -248,6 +250,16 @@ def test_window_uses_blue_white_theme_and_primary_button_roles(window):
     assert "qprogressbar::chunk" in style
     assert widget.scan_button.property("buttonRole") == "primary"
     assert widget.connect_button.property("buttonRole") == "primary"
+    assert all(
+        button.property("targetImageButton")
+        for button in (
+            widget.image_a_button,
+            widget.image_b_button,
+            widget.image_iap_button,
+        )
+    )
+    assert 'qpushbutton[targetimagebutton="true"]:checked' in style
+    assert "color: #ffffff" in style
     assert widget.start_button.property("buttonRole") == "primary"
 
 
@@ -289,6 +301,60 @@ async def test_selection_connects_using_original_ble_device(window):
     assert not widget.scan_button.isEnabled()
     assert not widget.device_filter.isEnabled()
     assert "正在连接：11:22" in widget.log_view.toPlainText()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_button_is_shown_only_after_device_info_succeeds(window):
+    widget, _, controller = window
+    device = Device("OTA", "11:22")
+    widget._on_device_detected(device, Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+
+    async def fail_to_read_info():
+        raise RuntimeError("设备未响应")
+
+    controller.get_current_image_info = fail_to_read_info
+    await widget.connect_selected()
+
+    assert widget.reconnect_button.isHidden()
+
+
+@pytest.mark.asyncio
+async def test_reconnects_last_verified_device_after_unexpected_disconnect(window):
+    widget, transport, controller = window
+    device = Device("OTA", "11:22")
+    info_reads = 0
+    original_get_info = controller.get_current_image_info
+
+    async def count_info_reads():
+        nonlocal info_reads
+        info_reads += 1
+        return await original_get_info()
+
+    controller.get_current_image_info = count_info_reads
+    widget._on_device_detected(device, Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+    await widget.connect_selected()
+
+    assert not widget.reconnect_button.isHidden()
+    assert not widget.reconnect_button.isEnabled()
+    assert info_reads == 1
+
+    transport.is_connected = False
+    widget._on_transport_disconnected(None)
+
+    assert not widget.reconnect_button.isHidden()
+    assert widget.reconnect_button.isEnabled()
+
+    widget.device_model.clear()
+    await widget.reconnect_last_device()
+
+    assert transport.connect_calls == 2
+    assert transport.connected_device is device
+    assert widget._connected
+    assert widget.current_info == controller.info
+    assert info_reads == 2
+    assert "正在重新连接：11:22" in widget.log_view.toPlainText()
 
 
 @pytest.mark.asyncio
@@ -409,6 +475,55 @@ async def test_current_image_b_upgrades_explicit_target_image_a(window, tmp_path
     assert target_info.image is ImageType.A
     assert widget.current_info.image is ImageType.B
     assert "目标 Image A" in widget.log_view.toPlainText()
+
+
+@pytest.mark.asyncio
+async def test_image_iap_uses_manually_selected_bin_erase_address(window, tmp_path: Path):
+    widget, transport, controller = window
+    transport.is_connected = True
+    controller.info = CurrentImageInfo(ChipType.CH583, ImageType.B, 16, 16)
+    widget._set_connected(True)
+    widget._apply_device_info(controller.info)
+
+    assert [
+        widget.image_a_button.text(),
+        widget.image_b_button.text(),
+        widget.image_iap_button.text(),
+    ] == ["IMAGEA", "IMAGEB", "IMAGE_IAP"]
+    assert widget.image_a_button.isChecked()
+
+    widget.erase_address.setText("0x00001000")
+    widget.image_iap_button.click()
+    binary = tmp_path / "ALL_firmware.bin"
+    binary.write_bytes(bytes(0x1000) + bytes(range(32)))
+    widget.set_firmware_path(binary)
+
+    assert widget.erase_address.text() == "0x00001000"
+    assert widget.erase_address.isEnabled()
+    await widget.start_upgrade()
+
+    firmware, target_info = controller.upgrades[-1]
+    assert firmware == FirmwareImage(0x1000, bytes(range(32)))
+    assert target_info.image is ImageType.IAP
+    assert "目标 Image IAP" in widget.log_view.toPlainText()
+
+
+def test_image_iap_rejects_hex_and_is_unavailable_for_ch579(window):
+    widget, transport, controller = window
+    transport.is_connected = True
+    widget._set_connected(True)
+    widget._apply_device_info(controller.info)
+    widget.image_iap_button.click()
+    hex_file = Path(__file__).parents[1] / "fixtures" / "firmware_contiguous.hex"
+
+    widget.set_firmware_path(hex_file)
+
+    assert not widget.start_button.isEnabled()
+
+    widget._apply_device_info(
+        CurrentImageInfo(ChipType.CH579, ImageType.A, 0x1200, 256)
+    )
+    assert not widget.image_iap_button.isEnabled()
 
 
 @pytest.mark.asyncio
