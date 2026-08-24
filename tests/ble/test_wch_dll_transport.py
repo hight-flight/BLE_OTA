@@ -50,6 +50,7 @@ class FakeBinding:
         self.indicate_result = 0
         self.read_results: dict[int, bytes] = {}
         self.thread_ids = []
+        self.enumerate_calls = 0
 
     def _record_thread(self) -> None:
         self.thread_ids.append(threading.get_ident())
@@ -60,6 +61,7 @@ class FakeBinding:
 
     def enumerate_devices(self, _scan_ms: int):
         self._record_thread()
+        self.enumerate_calls += 1
         return list(self.records)
 
     def open_device(self, device_id: str, callback):
@@ -237,6 +239,31 @@ async def test_scan_uses_dll_name_and_normalized_mac_address() -> None:
     assert device.address == "DC:32:62:1A:FD:22"
     assert advertisement.local_name == "JGS_CHICKEN_1.4.04"
     assert advertisement.rssi == -51
+
+
+@pytest.mark.asyncio
+async def test_wch_scan_repeats_until_explicitly_stopped() -> None:
+    binding = FakeBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    discoveries = []
+
+    await transport.start_scan(
+        lambda device, advertisement: discoveries.append((device, advertisement))
+    )
+    for _ in range(50):
+        if binding.enumerate_calls >= 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert transport.scan_is_continuous
+    assert binding.enumerate_calls >= 2
+    assert len(discoveries) >= 2
+
+    await transport.stop_scan()
+    calls_after_stop = binding.enumerate_calls
+    await asyncio.sleep(0.05)
+
+    assert binding.enumerate_calls == calls_after_stop
 
 
 def test_binding_decodes_wch_dll_scan_records() -> None:

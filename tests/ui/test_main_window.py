@@ -157,6 +157,36 @@ def test_device_filter_matches_name_or_address(window, qtbot):
     assert widget.device_proxy.index(0, 1).data() == "AA:BB:CC"
 
 
+def test_clickable_headers_sort_name_address_and_rssi(window):
+    widget, _, _ = window
+    widget._on_device_detected(Device("Zulu", "22:00"), Advertisement(None, -80))
+    widget._on_device_detected(Device("Alpha", "33:00"), Advertisement(None, -40))
+    widget._on_device_detected(Device("Mike", "11:00"), Advertisement(None, -60))
+
+    assert widget.device_view.isSortingEnabled()
+
+    widget.device_view.sortByColumn(0, Qt.AscendingOrder)
+    assert [widget.device_proxy.index(row, 0).data() for row in range(3)] == [
+        "Alpha",
+        "Mike",
+        "Zulu",
+    ]
+
+    widget.device_view.sortByColumn(1, Qt.DescendingOrder)
+    assert [widget.device_proxy.index(row, 1).data() for row in range(3)] == [
+        "33:00",
+        "22:00",
+        "11:00",
+    ]
+
+    widget.device_view.sortByColumn(2, Qt.DescendingOrder)
+    assert [widget.device_proxy.index(row, 2).data() for row in range(3)] == [
+        -40,
+        -60,
+        -80,
+    ]
+
+
 def test_each_device_row_contains_connect_and_disconnect_buttons(window):
     widget, _, _ = window
     widget._on_device_detected(Device("Feeder_A", "11:22:33"), Advertisement(None, -55))
@@ -262,7 +292,7 @@ async def test_selection_connects_using_original_ble_device(window):
 
 
 @pytest.mark.asyncio
-async def test_connect_keeps_scanner_active_until_connection_succeeds(qtbot):
+async def test_connect_stops_scanner_before_opening_device(qtbot):
     order = []
 
     class OrderedTransport(FakeTransport):
@@ -282,7 +312,7 @@ async def test_connect_keeps_scanner_active_until_connection_succeeds(qtbot):
 
     await widget.connect_selected()
 
-    assert order[:2] == ["connect", "stop_scan"]
+    assert order[:2] == ["stop_scan", "connect"]
 
 
 def test_empty_exception_log_includes_exception_type(window):

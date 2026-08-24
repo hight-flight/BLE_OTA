@@ -395,7 +395,7 @@ class WchDllTransport:
     """通过 WCH 官方 Windows DLL 访问 BLE 设备。"""
 
     backend_name = "WCH DLL"
-    scan_is_continuous = False
+    scan_is_continuous = True
     # 与已在目标设备验证可用的 Android Demo 一致：完整 20 字节帧，
     # 写入后静默等待再读取。6 字节第三方工具帧仅由控制器作备用。
     # 擦除是慢操作（50 个 4KB 块约 200KB），CH583 需数秒才能完成；
@@ -428,6 +428,9 @@ class WchDllTransport:
         self._initialized = False
         self._empty_read_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wch-ble")
+        self._scan_active = False
+        self._scan_task: asyncio.Task | None = None
+        self._scan_callback: ScanCallback | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -451,6 +454,37 @@ class WchDllTransport:
 
     async def start_scan(self, callback: ScanCallback) -> None:
         await self._ensure_initialized()
+        self._scan_callback = callback
+        if self._scan_active:
+            return
+        self._scan_active = True
+        try:
+            await self._scan_once(callback)
+        except Exception:
+            self._scan_active = False
+            raise
+        if self._scan_active:
+            self._scan_task = asyncio.create_task(self._scan_loop())
+
+    async def _scan_loop(self) -> None:
+        try:
+            while self._scan_active and not self.is_connected:
+                await asyncio.sleep(0.05)
+                if not self._scan_active:
+                    break
+                callback = self._scan_callback
+                if callback is not None:
+                    await self._scan_once(callback)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._trace(f"WCH DLL 持续扫描停止：{error}")
+        finally:
+            self._scan_active = False
+            if asyncio.current_task() is self._scan_task:
+                self._scan_task = None
+
+    async def _scan_once(self, callback: ScanCallback) -> None:
         self._trace(f"WCH DLL 扫描开始：时长={self._scan_duration_ms} ms")
         started = perf_counter()
         records = await self._call_binding(
@@ -467,7 +501,16 @@ class WchDllTransport:
             )
 
     async def stop_scan(self) -> None:
-        return None
+        self._scan_active = False
+        task = self._scan_task
+        self._scan_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def connect(self, device: WchDevice) -> None:
         await self._ensure_initialized()

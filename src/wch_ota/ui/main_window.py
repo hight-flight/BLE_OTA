@@ -88,8 +88,10 @@ class MainWindow(QMainWindow):
         self.device_proxy.setSourceModel(self.device_model)
         self.device_proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.device_proxy.setFilterKeyColumn(-1)
+        self.device_proxy.setDynamicSortFilter(True)
         self.device_view = QTableView()
         self.device_view.setModel(self.device_proxy)
+        self.device_view.setSortingEnabled(True)
         self.device_view.setSelectionBehavior(QTableView.SelectRows)
         self.device_view.setSelectionMode(QTableView.SingleSelection)
         self.device_view.setAlternatingRowColors(True)
@@ -235,6 +237,7 @@ class MainWindow(QMainWindow):
         self.clear_log_button.clicked.connect(self.log_view.clear)
         self.device_filter.textChanged.connect(self._apply_device_filter)
         self.device_view.selectionModel().selectionChanged.connect(self._refresh_controls)
+        self.device_proxy.layoutChanged.connect(self._sync_device_action_widgets)
 
     @asyncSlot()
     async def _scan_slot(self) -> None:
@@ -363,16 +366,14 @@ class MainWindow(QMainWindow):
         async with self._connection_lock:
             self._connection_busy = True
             self._refresh_controls()
+            resume_scan_on_failure = self._scanning
             try:
+                await self.transport.stop_scan()
+                self._set_scanning(False)
                 self._append_log(f"正在连接：{getattr(device, 'address', '')}")
                 await self.transport.connect(device)
                 self._connected_address = str(getattr(device, "address", ""))
                 self._set_connected(True)
-                try:
-                    await self.transport.stop_scan()
-                    self._set_scanning(False)
-                except Exception as error:
-                    self._report_error("连接成功，但停止扫描失败", error)
                 self._append_log(f"已连接：{getattr(device, 'address', '')}")
                 properties = ", ".join(
                     getattr(self.transport, "ota_characteristic_properties", ())
@@ -393,6 +394,8 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 self._set_connected(False)
                 self._report_error("连接失败", error)
+                if resume_scan_on_failure:
+                    await self.start_scan()
             finally:
                 self._connection_busy = False
                 self._refresh_controls()
