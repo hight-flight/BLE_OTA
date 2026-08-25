@@ -138,6 +138,8 @@ async def test_upgrade_sends_exact_commands_and_emits_ordered_successful_stages(
         UpgradeStage.END,
     ]
     assert events[-1].status is UpgradeStatus.SUCCESS
+    assert events[-1].progress == len(firmware.data)
+    assert events[-1].total == len(firmware.data)
 
 
 @pytest.mark.asyncio
@@ -549,6 +551,51 @@ async def test_cancel_after_program_packet_stops_before_next_packet() -> None:
     await controller.upgrade(FirmwareImage(0, bytes(40)), image_info())
 
     assert [packet[0] for packet in transport.writes] == [0x84, 0x81, 0x80]
+    assert events[-1].status is UpgradeStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_erase_wait_stops_before_reads_and_fallback_commands() -> None:
+    transport = FakeTransport(responses=[info_response()])
+    events = []
+    controller = None
+
+    async def cancel_during_erase_wait(delay: float) -> None:
+        if delay >= 1.0:
+            controller.cancel()
+
+    controller = OtaController(
+        transport, events.append, sleep=cancel_during_erase_wait
+    )
+
+    await controller.upgrade(FirmwareImage(0, bytes(16)), image_info())
+
+    assert transport.writes == [
+        build_info_command(),
+        build_erase_command(0, 1, ChipType.CH583, target_image=ImageType.A),
+    ]
+    assert transport.read_calls == 1
+    assert events[-1].status is UpgradeStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_pre_erase_info_wait_never_sends_erase_command() -> None:
+    transport = FakeTransport(responses=[info_response()])
+    events = []
+    controller = None
+
+    async def cancel_during_info_wait(delay: float) -> None:
+        if delay == 0.2:
+            controller.cancel()
+
+    controller = OtaController(
+        transport, events.append, sleep=cancel_during_info_wait
+    )
+
+    await controller.upgrade(FirmwareImage(0, bytes(16)), image_info())
+
+    assert transport.writes == [build_info_command()]
+    assert transport.read_calls == 0
     assert events[-1].status is UpgradeStatus.CANCELLED
 
 

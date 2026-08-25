@@ -266,6 +266,33 @@ async def test_wch_scan_repeats_until_explicitly_stopped() -> None:
     assert binding.enumerate_calls == calls_after_stop
 
 
+@pytest.mark.asyncio
+async def test_wch_continuous_scan_recovers_after_one_enumeration_error() -> None:
+    class FlakyScanBinding(FakeBinding):
+        def enumerate_devices(self, _scan_ms: int):
+            self._record_thread()
+            self.enumerate_calls += 1
+            if self.enumerate_calls == 2:
+                raise RuntimeError("临时扫描失败")
+            return list(self.records)
+
+    binding = FlakyScanBinding()
+    traces = []
+    transport = WchDllTransport(
+        binding=binding, scan_duration_ms=1, trace_callback=traces.append
+    )
+
+    await transport.start_scan(lambda _device, _advertisement: None)
+    for _ in range(100):
+        if binding.enumerate_calls >= 3:
+            break
+        await asyncio.sleep(0.01)
+
+    assert binding.enumerate_calls >= 3
+    assert any("持续扫描失败，将继续重试" in message for message in traces)
+    await transport.stop_scan()
+
+
 def test_binding_decodes_wch_dll_scan_records() -> None:
     raw = FakeRawDll()
     binding = WchDllBinding(library=raw)

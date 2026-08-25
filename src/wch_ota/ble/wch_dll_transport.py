@@ -474,11 +474,15 @@ class WchDllTransport:
                     break
                 callback = self._scan_callback
                 if callback is not None:
-                    await self._scan_once(callback)
+                    try:
+                        await self._scan_once(callback)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        self._trace(f"WCH DLL 持续扫描失败，将继续重试：{error}")
+                        await asyncio.sleep(0.25)
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            self._trace(f"WCH DLL 持续扫描停止：{error}")
         finally:
             self._scan_active = False
             if asyncio.current_task() is self._scan_task:

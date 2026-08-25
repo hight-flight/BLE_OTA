@@ -116,6 +116,12 @@ QLineEdit {
     padding: 1px 6px;
 }
 
+QLineEdit:disabled {
+    color: #949DA6;
+    background-color: #E9EDF1;
+    border-color: #D2D8DE;
+}
+
 QPlainTextEdit {
     font-family: Consolas, "Microsoft YaHei";
     font-size: 13px;

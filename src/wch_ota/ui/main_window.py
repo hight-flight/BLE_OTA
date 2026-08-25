@@ -50,6 +50,9 @@ class MainWindow(QMainWindow):
         self._upgrading = False
         self._connection_busy = False
         self._connection_lock = asyncio.Lock()
+        self._info_busy = False
+        self._info_lock = asyncio.Lock()
+        self._connection_generation = 0
         self._disconnecting = False
         self._firmware_valid = False
         self._firmware_cache_key: tuple[Any, ...] | None = None
@@ -57,6 +60,7 @@ class MainWindow(QMainWindow):
         self._shutdown_task: asyncio.Task | None = None
         self._upgrade_task: asyncio.Task | None = None
         self._shutdown_complete = False
+        self._transport_cleanup_complete = False
         self.setWindowTitle("WCH BLE OTA 工具")
         self.resize(1200, 800)
         self._build_ui()
@@ -131,6 +135,7 @@ class MainWindow(QMainWindow):
         self.connect_button.hide()
         self.disconnect_button.hide()
         self.reconnect_button = QPushButton("重新连接")
+        self.reconnect_button.setProperty("buttonRole", "primary")
         self.reconnect_button.hide()
         self.info_button = QPushButton("获取信息")
         self.connect_button.setProperty("buttonRole", "primary")
@@ -410,6 +415,7 @@ class MainWindow(QMainWindow):
                 await self.transport.connect(device)
                 self._active_device = device
                 self._connected_address = str(getattr(device, "address", ""))
+                self._ensure_connected_device_visible(device)
                 self._set_connected(True)
                 result = "重新连接成功" if reconnecting else "已连接"
                 self._append_log(f"{result}：{getattr(device, 'address', '')}")
@@ -438,6 +444,35 @@ class MainWindow(QMainWindow):
                 self._connection_busy = False
                 self._refresh_controls()
 
+    def _ensure_connected_device_visible(self, device: Any) -> None:
+        """重连不依赖扫描列表，但连接后必须恢复可操作的设备行。"""
+        address = str(getattr(device, "address", ""))
+        source_row = next(
+            (
+                row
+                for row in range(self.device_model.rowCount())
+                if str(self.device_model.index(row, 1).data() or "") == address
+            ),
+            None,
+        )
+        if source_row is None:
+            self.device_model.update_device(device, None)
+        visible_row = next(
+            (
+                row
+                for row in range(self.device_proxy.rowCount())
+                if str(self.device_proxy.index(row, 1).data() or "") == address
+            ),
+            None,
+        )
+        if visible_row is None:
+            self.device_filter.clear()
+        self._sync_device_action_widgets()
+        for row in range(self.device_proxy.rowCount()):
+            if str(self.device_proxy.index(row, 1).data() or "") == address:
+                self.device_view.selectRow(row)
+                break
+
     async def disconnect(self) -> None:
         self._disconnecting = True
         try:
@@ -448,6 +483,8 @@ class MainWindow(QMainWindow):
             self._report_error("断开失败", error)
         finally:
             self._disconnecting = False
+            if not self.transport.is_connected:
+                self._set_connected(False)
 
     def handle_transport_disconnected(self, client: Any) -> None:
         """可从 Bleak 回调线程安全调用的公开断开入口。"""
@@ -464,17 +501,30 @@ class MainWindow(QMainWindow):
         self._append_log("设备意外断开")
 
     async def get_device_info(self) -> None:
-        try:
-            info = await self.controller.get_current_image_info()
-            self._apply_device_info(info)
-            if self._active_device is not None:
-                self._last_verified_device = self._active_device
-                self.reconnect_button.show()
+        if self._info_lock.locked():
+            self._append_log("设备信息读取正在进行中")
+            return
+        async with self._info_lock:
+            self._info_busy = True
+            self._refresh_controls()
+            generation = self._connection_generation
+            try:
+                info = await self.controller.get_current_image_info()
+                if not self._connected or generation != self._connection_generation:
+                    return
+                self._apply_device_info(info)
+                if self._active_device is not None:
+                    self._last_verified_device = self._active_device
+                    self.reconnect_button.show()
+                    self._refresh_controls()
+                self._append_log("已读取设备镜像信息")
+            except Exception as error:
+                if self._connected and generation == self._connection_generation:
+                    self._invalidate_device_info()
+                    self._report_error("获取信息失败", error)
+            finally:
+                self._info_busy = False
                 self._refresh_controls()
-            self._append_log("已读取设备镜像信息")
-        except Exception as error:
-            self._invalidate_device_info()
-            self._report_error("获取信息失败", error)
 
     def _invalidate_device_info(self) -> None:
         self.current_info = None
@@ -601,8 +651,8 @@ class MainWindow(QMainWindow):
             self._report_error("升级失败", error)
         finally:
             if owner:
-                self._set_upgrading(False)
                 self._upgrade_task = None
+                self._set_upgrading(False)
 
     @Slot()
     def cancel_upgrade(self) -> None:
@@ -620,6 +670,8 @@ class MainWindow(QMainWindow):
         self._set_upgrading(event.status is UpgradeStatus.RUNNING)
 
     def _set_connected(self, connected: bool) -> None:
+        if connected != self._connected:
+            self._connection_generation += 1
         self._connected = connected
         if not connected:
             self._invalidate_device_info()
@@ -638,7 +690,15 @@ class MainWindow(QMainWindow):
 
     def _refresh_controls(self, *_args) -> None:
         selected = bool(self.device_view.selectionModel().selectedRows())
-        idle = not self._upgrading and not self._connection_busy
+        upgrade_task_running = (
+            self._upgrade_task is not None and not self._upgrade_task.done()
+        )
+        idle = (
+            not self._upgrading
+            and not upgrade_task_running
+            and not self._connection_busy
+            and not self._info_busy
+        )
         self.device_view.setEnabled(idle)
         self.scan_button.setEnabled(idle and not self._connected)
         self.device_filter.setEnabled(idle and not self._connected)
@@ -699,31 +759,48 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._append_log(f"取消升级失败：{error}")
 
-        upgrade_task = self._upgrade_task
-        if (
-            upgrade_task is not None
-            and upgrade_task is not asyncio.current_task()
-            and not upgrade_task.done()
-        ):
-            try:
-                await asyncio.shield(upgrade_task)
-            except asyncio.CancelledError:
-                if not upgrade_task.cancelled():
-                    raise
-            except Exception as error:
-                self._append_log(f"等待升级结束失败：{error}")
+        try:
+            upgrade_task = self._upgrade_task
+            if (
+                upgrade_task is not None
+                and upgrade_task is not asyncio.current_task()
+                and not upgrade_task.done()
+            ):
+                try:
+                    await asyncio.shield(upgrade_task)
+                except asyncio.CancelledError:
+                    if not upgrade_task.cancelled():
+                        raise
+                except Exception as error:
+                    self._append_log(f"等待升级结束失败：{error}")
+        finally:
+            await self._cleanup_transport()
 
-        for operation in (self.transport.stop_scan, self.transport.disconnect):
+    async def _cleanup_transport(self) -> None:
+        """即使等待升级被取消，也必须尽力释放扫描器与连接句柄。"""
+        if self._transport_cleanup_complete:
+            return
+        operations = (
+            ("停止扫描", self.transport.stop_scan),
+            ("断开设备", self.transport.disconnect),
+        )
+        for label, operation in operations:
             try:
-                await operation()
+                async with asyncio.timeout(1.0):
+                    await operation()
+            except TimeoutError:
+                self._append_log(f"关闭清理超时：{label}")
             except Exception as error:
                 self._append_log(f"关闭清理失败：{error}")
+        self._transport_cleanup_complete = True
 
     async def _shutdown_and_close(self) -> None:
         try:
             await asyncio.wait_for(self.shutdown(), 3.0)
         except TimeoutError:
             self._append_log("关闭清理超时，窗口将强制关闭")
+            if not self._transport_cleanup_complete:
+                await self._cleanup_transport()
         except Exception as error:
             self._append_log(f"关闭清理失败：{error}")
         finally:

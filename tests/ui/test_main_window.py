@@ -248,8 +248,13 @@ def test_window_uses_blue_white_theme_and_primary_button_roles(window):
     assert "border-radius: 8px" in style
     assert "qheaderview::section" in style
     assert "qprogressbar::chunk" in style
+    assert "qlineedit:disabled" in style
     assert widget.scan_button.property("buttonRole") == "primary"
     assert widget.connect_button.property("buttonRole") == "primary"
+    assert widget.reconnect_button.property("buttonRole") == "primary"
+    assert style.index("qpushbutton:disabled") > style.index(
+        'qpushbutton[buttonrole="primary"]'
+    )
     assert all(
         button.property("targetImageButton")
         for button in (
@@ -355,6 +360,38 @@ async def test_reconnects_last_verified_device_after_unexpected_disconnect(windo
     assert widget.current_info == controller.info
     assert info_reads == 2
     assert "正在重新连接：11:22" in widget.log_view.toPlainText()
+    assert widget.device_proxy.rowCount() == 1
+    action_widget = widget.device_view.indexWidget(widget.device_proxy.index(0, 3))
+    assert action_widget is not None
+    row_buttons = action_widget.findChildren(type(widget.info_button))
+    assert row_buttons[1].text() == "断开"
+    assert row_buttons[1].isEnabled()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_error_still_updates_ui_when_transport_is_already_closed(
+    qtbot,
+):
+    class ClosedThenFailedTransport(FakeTransport):
+        async def disconnect(self):
+            self.disconnected += 1
+            self.is_connected = False
+            raise RuntimeError("关闭句柄失败")
+
+    transport = ClosedThenFailedTransport()
+    controller = FakeController()
+    widget = MainWindow(transport=transport, controller=controller)
+    qtbot.addWidget(widget)
+    device = Device("OTA", "11:22")
+    widget._on_device_detected(device, Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+    await widget.connect_selected()
+
+    await widget.disconnect()
+
+    assert not widget._connected
+    assert widget.reconnect_button.isEnabled()
+    assert "断开失败：关闭句柄失败" in widget.log_view.toPlainText()
 
 
 @pytest.mark.asyncio
@@ -442,9 +479,11 @@ async def test_bin_address_and_hex_automatic_address_are_passed_to_upgrade(
     transport.is_connected = True
     widget._set_connected(True)
     widget._apply_device_info(controller.info)
+    assert not widget.erase_address.isEnabled()
     binary = tmp_path / "app.bin"
     binary.write_bytes(bytes(0x4000) + b"\x01\x02")
     widget.set_firmware_path(binary)
+    assert widget.erase_address.isEnabled()
     widget.erase_address.setText("0x4000")
 
     await widget.start_upgrade()
@@ -592,6 +631,39 @@ async def test_failed_info_read_invalidates_previous_device_info(window):
 
 
 @pytest.mark.asyncio
+async def test_late_device_info_is_ignored_after_connection_changes(qtbot):
+    info_started = asyncio.Event()
+    release_info = asyncio.Event()
+
+    class DelayedInfoController(FakeController):
+        async def get_current_image_info(self):
+            info_started.set()
+            await release_info.wait()
+            return self.info
+
+    transport = FakeTransport()
+    controller = DelayedInfoController()
+    transport.is_connected = True
+    widget = MainWindow(transport=transport, controller=controller)
+    qtbot.addWidget(widget)
+    widget._set_connected(True)
+
+    info_task = asyncio.create_task(widget.get_device_info())
+    await info_started.wait()
+    assert not widget.disconnect_button.isEnabled()
+
+    transport.is_connected = False
+    widget._on_transport_disconnected(None)
+    release_info.set()
+    await info_task
+
+    assert not widget._connected
+    assert widget.current_info is None
+    assert widget.chip_label.text() == "-"
+    assert "已读取设备镜像信息" not in widget.log_view.toPlainText()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_stops_scan_and_disconnects(window):
     widget, transport, _ = window
 
@@ -636,6 +708,46 @@ def test_unexpected_disconnect_restores_idle_disconnected_state(window):
     assert "设备意外断开" in widget.log_view.toPlainText()
 
 
+@pytest.mark.asyncio
+async def test_unexpected_disconnect_keeps_connections_blocked_until_upgrade_exits(
+    qtbot, tmp_path
+):
+    upgrade_started = asyncio.Event()
+    finish_upgrade = asyncio.Event()
+
+    class SlowCancelController(FakeController):
+        async def upgrade(self, firmware, info):
+            upgrade_started.set()
+            await finish_upgrade.wait()
+
+    transport = FakeTransport()
+    controller = SlowCancelController()
+    widget = MainWindow(transport=transport, controller=controller)
+    qtbot.addWidget(widget)
+    device = Device("OTA", "11:22")
+    widget._on_device_detected(device, Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+    await widget.connect_selected()
+    firmware = tmp_path / "app.bin"
+    firmware.write_bytes(b"\x01")
+    widget.set_firmware_path(firmware)
+
+    upgrade_task = asyncio.create_task(widget.start_upgrade())
+    await upgrade_started.wait()
+    transport.is_connected = False
+    widget._on_transport_disconnected(None)
+
+    assert not widget.reconnect_button.isEnabled()
+    assert not widget.connect_button.isEnabled()
+    assert not widget.device_view.isEnabled()
+
+    finish_upgrade.set()
+    await upgrade_task
+
+    assert widget.reconnect_button.isEnabled()
+    assert widget.device_view.isEnabled()
+
+
 class CloseEvent:
     def __init__(self):
         self.accepted = False
@@ -668,12 +780,21 @@ async def test_close_waits_for_normal_cleanup_and_reuses_one_task(window):
 
 @pytest.mark.asyncio
 async def test_close_times_out_cleanup_after_three_seconds(window, monkeypatch):
-    widget, _, _ = window
+    widget, transport, _ = window
     captured = {}
+    never_finishes = asyncio.Event()
+    blocker = asyncio.create_task(never_finishes.wait())
+    widget._upgrade_task = blocker
 
     async def timeout(awaitable, seconds):
         captured["seconds"] = seconds
-        awaitable.close()
+        task = asyncio.create_task(awaitable)
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         raise TimeoutError
 
     monkeypatch.setattr(asyncio, "wait_for", timeout)
@@ -684,7 +805,54 @@ async def test_close_times_out_cleanup_after_three_seconds(window, monkeypatch):
     assert event.ignored
     assert captured["seconds"] == 3.0
     assert widget._shutdown_complete
+    assert transport.stopped == 1
+    assert transport.disconnected == 1
     assert "关闭清理超时" in widget.log_view.toPlainText()
+    blocker.cancel()
+    try:
+        await blocker
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_during_stop_scan_still_attempts_disconnect(
+    qtbot, monkeypatch
+):
+    class HangingStopTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.stop_started = asyncio.Event()
+            self.stop_calls = 0
+            self.never_stop = asyncio.Event()
+
+        async def stop_scan(self):
+            self.stop_calls += 1
+            self.stop_started.set()
+            await self.never_stop.wait()
+
+    transport = HangingStopTransport()
+    widget = MainWindow(transport=transport, controller=FakeController())
+    qtbot.addWidget(widget)
+
+    async def timeout_during_cleanup(awaitable, _seconds):
+        task = asyncio.create_task(awaitable)
+        await transport.stop_started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", timeout_during_cleanup)
+    event = CloseEvent()
+    widget.closeEvent(event)
+    await widget._shutdown_task
+
+    assert transport.stop_calls >= 2
+    assert transport.disconnected == 1
+    assert widget._shutdown_complete
 
 
 @pytest.mark.asyncio

@@ -219,6 +219,8 @@ class OtaController:
             return True
         # 擦除前刷新一次 INFO 通道，与 Android 先读取镜像信息再进入升级的顺序一致。
         await self._refresh_info_before_erase()
+        if self._stop_if_cancelled():
+            return True
         android_command = build_erase_command(
             start_address,
             block_count,
@@ -240,16 +242,22 @@ class OtaController:
         # Windows 端也保持相同 ATT 写入类型，避免设备固件区分 Write Request/Command。
         erase_write_with_response = False
         response = await self._send_erase_and_read(command)
+        if self._stop_if_cancelled():
+            return True
         compatibility = ""
         probe = ""
         if not response:
             probe_message, probe_valid, _ = await self._probe_info_channel()
+            if self._stop_if_cancelled():
+                return True
             probe = f"；{probe_message}"
             if probe_valid:
                 if self._transport.supports_write_with_response:
                     response_retry = await self._send_erase_and_read(
                         command, response=True
                     )
+                    if self._stop_if_cancelled():
+                        return True
                     response_retry_rx = (
                         response_retry.hex(" ").upper() or "空"
                     )
@@ -265,6 +273,8 @@ class OtaController:
                         return False
                 if fallback_command is not None:
                     fallback_response = await self._send_erase_and_read(fallback_command)
+                    if self._stop_if_cancelled():
+                        return True
                     fallback_rx = fallback_response.hex(" ").upper() or "空"
                     compatibility = (
                         f"；{fallback_label}TX={fallback_command.hex(' ').upper()}；"
@@ -308,6 +318,8 @@ class OtaController:
         )
         if settle_delay > 0:
             await self._sleep(settle_delay)
+        if self._cancel_requested.is_set():
+            return b""
         return await self._read_nonempty_response(
             attempts=self._erase_read_attempts(),
             retry_delay=float(
@@ -368,6 +380,8 @@ class OtaController:
     ) -> bytes:
         """轮询空 GATT 值，为耗时较长的擦除保留约 10 秒响应窗口。"""
         for attempt in range(attempts):
+            if self._cancel_requested.is_set():
+                return b""
             response = await self._transport.read_ota()
             if response:
                 return bytes(response)
@@ -406,13 +420,17 @@ class OtaController:
         try:
             await self._transport.write_ota(build_info_command(), response=False)
             await self._sleep(_READ_NULL_RETRY_DELAY)
+            if self._cancel_requested.is_set():
+                return b""
             response = bytes(await self._transport.read_ota())
         except TransportError:
             return b""
         return response if parse_image_info_response(response) is not None else b""
 
     async def _end(self) -> bool:
-        self._start_stage(UpgradeStage.END)
+        self._stage = UpgradeStage.END
+        self._progress = self._total
+        self._emit(UpgradeStatus.RUNNING)
         if self._stop_if_cancelled():
             return True
         await self._transport.write_ota(build_end_command())
