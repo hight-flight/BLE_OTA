@@ -443,6 +443,7 @@ async def test_transport_retries_failed_native_scan_unregistration() -> None:
 
     with pytest.raises(TransportError, match="注销实时广播扫描失败"):
         await transport.stop_scan()
+    assert transport._scan_active
     assert transport._native_scan_active
 
     await transport.stop_scan()
@@ -548,6 +549,34 @@ def test_binding_opens_live_advertising_device_by_address() -> None:
     assert handle == raw.handle
     assert raw.opened_address == bytes.fromhex("DC 32 62 1A FD 22")
     assert raw.cache_modes == [False]
+
+
+def test_binding_keeps_failed_native_connection_callback_alive() -> None:
+    class EmptyHandleDll(FakeRawDll):
+        def WCHBLEOpenDeviceAddress(self, _address, _is_cache_mode, callback):
+            self.failed_callback = callback
+            return None
+
+    raw = EmptyHandleDll()
+    binding = WchDllBinding(library=raw)
+
+    with pytest.raises(TransportError, match="空句柄"):
+        binding.open_device_address(
+            "DC:32:62:1A:FD:22", lambda _handle, _state: None
+        )
+
+    assert raw.failed_callback in binding._retired_connection_callbacks
+
+
+def test_binding_retires_native_connection_callback_after_close() -> None:
+    raw = FakeRawDll()
+    binding = WchDllBinding(library=raw)
+    handle = binding.open_device("device-id", lambda _handle, _state: None)
+    callback = raw.connection_callback
+
+    binding.close_device(handle)
+
+    assert callback in binding._retired_connection_callbacks
 
 
 @pytest.mark.asyncio
@@ -742,6 +771,90 @@ async def test_device_id_connection_failure_rescans_and_retries_latest_device_id
 
 
 @pytest.mark.asyncio
+async def test_early_disconnect_from_stale_device_id_falls_back_to_fresh_device_id() -> None:
+    class EarlyDisconnectThenConnectBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.open_attempts = []
+
+        def open_device(self, device_id: str, callback):
+            self.open_attempts.append(device_id)
+            if device_id.startswith("BluetoothLE#stale-"):
+                callback(self.handle, False)
+            else:
+                self.connection_callback = callback
+            return self.handle
+
+    binding = EarlyDisconnectThenConnectBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    stale_id = "BluetoothLE#stale-dc:32:62:1a:fd:22"
+
+    await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", stale_id))
+
+    assert binding.open_attempts == [stale_id, binding.records[0].device_id]
+    assert binding.closed == [binding.handle]
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_retries_gatt_discovery_until_device_is_ready() -> None:
+    class SlowGattBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_calls = 0
+
+        def has_ota_characteristic(self, handle) -> bool:
+            assert handle is self.handle
+            self.discovery_calls += 1
+            return self.discovery_calls >= 3
+
+    binding = SlowGattBinding()
+    transport = WchDllTransport(binding=binding)
+    transport.gatt_discovery_retry_delay = 0
+
+    await transport.connect(
+        WchDevice("OTA", "DC:32:62:1A:FD:22", binding.records[0].device_id)
+    )
+
+    assert binding.discovery_calls == 3
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_scan_unregistration_blocks_device_id_fallback() -> None:
+    class StopFailureDuringFallbackBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.open_attempts = []
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            return False
+
+        def open_device_address(self, _address: str, _callback):
+            return None
+
+        def open_device(self, device_id: str, callback):
+            self.open_attempts.append(device_id)
+            return super().open_device(device_id, callback)
+
+    binding = StopFailureDuringFallbackBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    await transport.start_scan(lambda *_args: None)
+
+    with pytest.raises(TransportError, match="注销实时广播扫描失败"):
+        await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", ""))
+
+    assert binding.open_attempts == []
+    assert transport._scan_active
+    assert transport._native_scan_active
+
+
+@pytest.mark.asyncio
 async def test_connect_closes_new_handle_when_stopping_live_scan_fails() -> None:
     class StopFailureBinding(FakeBinding):
         def register_advertising_notify(self, _callback) -> bool:
@@ -781,7 +894,7 @@ async def test_disconnect_callback_before_open_returns_rejects_connection() -> N
         await transport.connect(device)
 
     assert not transport.is_connected
-    assert binding.closed == [binding.handle]
+    assert binding.closed == [binding.handle, binding.handle]
 
 
 def test_binding_accepts_device_id_suffix_after_device_mac() -> None:
@@ -1006,6 +1119,24 @@ def test_binding_unregisters_indicate_before_releasing_callback() -> None:
     assert characteristic == 0xFEE1
     assert callback is None
     assert 0xFEE1 not in binding._notify_callbacks
+
+
+def test_notification_buffers_are_isolated_by_connection_handle() -> None:
+    raw = FakeRawDll()
+    binding = WchDllBinding(library=raw)
+    first_handle = 0x1111
+    second_handle = 0x2222
+
+    binding.register_read_notify(first_handle, 0xFEE1)
+    first_callback = raw.notification_registrations[-1][2]
+    binding.register_read_notify(second_handle, 0xFEE1)
+    second_callback = raw.notification_registrations[-1][2]
+    stale = (ctypes.c_ubyte * 2)(0x05, 0x00)
+    current = (ctypes.c_ubyte * 2)(0x00, 0x00)
+    first_callback(None, stale, 2)
+    second_callback(None, current, 2)
+
+    assert binding.read_notify(second_handle, 0xFEE1) == b"\x00\x00"
 
 
 @pytest.mark.asyncio

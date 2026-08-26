@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal, Slot
+from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHeaderView, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
@@ -71,6 +71,10 @@ class MainWindow(QMainWindow):
         self.ota_event_received.connect(self._on_ota_event)
         self.transport_disconnected.connect(self._on_transport_disconnected)
         self.transport_trace_received.connect(self._on_transport_trace)
+        self._device_expiry_timer = QTimer(self)
+        self._device_expiry_timer.setInterval(2000)
+        self._device_expiry_timer.timeout.connect(self._prune_stale_devices)
+        self._device_expiry_timer.start()
         self.controller._event_callback = self.ota_event_received.emit
         self._refresh_controls()
         self.hide()
@@ -320,6 +324,14 @@ class MainWindow(QMainWindow):
             self.device_model.rowCount() != source_rows
             or self.device_proxy.rowCount() != visible_rows
         ):
+            self._sync_device_action_widgets()
+            self._refresh_controls()
+
+    @Slot()
+    def _prune_stale_devices(self) -> None:
+        if not self._scanning or self._connected:
+            return
+        if self.device_model.prune_stale(max_age_seconds=15.0):
             self._sync_device_action_widgets()
             self._refresh_controls()
 

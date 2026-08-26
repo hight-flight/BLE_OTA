@@ -151,29 +151,8 @@ class OtaController:
             raise OtaError(f"固件起始地址必须按 {address_base} 字节对齐")
         if not firmware.data:
             raise OtaError("固件数据不能为空")
-        if (
-            info.chip is not ChipType.CH579
-            and info.image in {ImageType.A, ImageType.B}
-            and info.offset > 0
-            and len(firmware.data) > info.offset
-        ):
-            raise OtaError(
-                f"固件大小 {len(firmware.data)} 字节超过目标 Image 最大大小 "
-                f"{info.offset} 字节"
-            )
-
-        end_address = start_address + len(firmware.data) - 1
-        maximum_address = 0xFFFF * address_base + (address_base - 1)
-        if end_address > maximum_address:
-            raise OtaError("固件地址范围超出芯片协议上限")
-
-        block_count = self._block_count(len(firmware.data), info.block_size)
-        if start_address % info.block_size:
-            raise OtaError(
-                f"固件起始地址必须按擦除块大小 {info.block_size} 字节对齐"
-            )
         try:
-            build_program_command(
+            first_command = build_program_command(
                 start_address,
                 firmware.data,
                 0,
@@ -182,6 +161,31 @@ class OtaController:
             )
         except ValueError as error:
             raise OtaError(f"固件传输参数无效：{error}") from error
+        payload_length = first_command[1]
+        transfer_length = (
+            (len(firmware.data) + payload_length - 1) // payload_length
+        ) * payload_length
+        if (
+            info.chip is not ChipType.CH579
+            and info.image in {ImageType.A, ImageType.B}
+            and info.offset > 0
+            and transfer_length > info.offset
+        ):
+            raise OtaError(
+                f"固件补齐后大小 {transfer_length} 字节超过目标 Image 最大大小 "
+                f"{info.offset} 字节"
+            )
+
+        end_address = start_address + transfer_length - 1
+        maximum_address = 0xFFFF * address_base + (address_base - 1)
+        if end_address > maximum_address:
+            raise OtaError("固件补齐后的地址范围超出芯片协议上限")
+
+        block_count = self._block_count(transfer_length, info.block_size)
+        if start_address % info.block_size:
+            raise OtaError(
+                f"固件起始地址必须按擦除块大小 {info.block_size} 字节对齐"
+            )
         return block_count
 
     @staticmethod

@@ -1,6 +1,7 @@
 """BLE 扫描结果表格模型。"""
 
 import re
+from time import monotonic
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
@@ -18,12 +19,13 @@ def normalize_device_address(address: Any) -> str:
 class DeviceTableModel(QAbstractTableModel):
     HEADERS = ("设备名", "地址", "RSSI", "操作")
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, clock=monotonic) -> None:
         super().__init__(parent)
+        self._clock = clock
         self._rows: list[tuple[Any, Any]] = []
         self._addresses: dict[str, int] = {}
         self._names: dict[str, str] = {}
-        self._pending_names: dict[str, tuple[str, int]] = {}
+        self._last_seen: dict[str, float] = {}
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
@@ -66,17 +68,7 @@ class DeviceTableModel(QAbstractTableModel):
             # 同一扫描周期可能先后收到 Shortened/Complete Local Name，保留信息更完整者。
             if len(current_name) >= len(previous_name):
                 self._names[address] = current_name
-                self._pending_names.pop(address, None)
-            elif current_name != previous_name:
-                # 真实改名也可能比旧名称短。连续收到相同短名称后再接受，避免
-                # 单个 Shortened Local Name 包覆盖完整名称。
-                pending_name, count = self._pending_names.get(address, ("", 0))
-                count = count + 1 if pending_name == current_name else 1
-                if count >= 3:
-                    self._names[address] = current_name
-                    self._pending_names.pop(address, None)
-                else:
-                    self._pending_names[address] = (current_name, count)
+        self._last_seen[address] = self._clock()
         if address in self._addresses:
             row = self._addresses[address]
             previous_device, _ = self._rows[row]
@@ -95,6 +87,32 @@ class DeviceTableModel(QAbstractTableModel):
         self._rows.append((device, advertisement))
         self._addresses[address] = row
         self.endInsertRows()
+
+    def prune_stale(self, *, max_age_seconds: float) -> int:
+        """移除超过指定时间未收到广播的设备。"""
+        now = self._clock()
+        stale = {
+            address
+            for address, seen_at in self._last_seen.items()
+            if now - seen_at > max_age_seconds
+        }
+        if not stale:
+            return 0
+        self.beginResetModel()
+        self._rows = [
+            row
+            for row in self._rows
+            if normalize_device_address(getattr(row[0], "address", "")) not in stale
+        ]
+        self._addresses = {
+            normalize_device_address(getattr(device, "address", "")): index
+            for index, (device, _advertisement) in enumerate(self._rows)
+        }
+        for address in stale:
+            self._names.pop(address, None)
+            self._last_seen.pop(address, None)
+        self.endResetModel()
+        return len(stale)
 
     @staticmethod
     def _raw_local_name(advertisement: Any) -> str | None:
@@ -148,5 +166,5 @@ class DeviceTableModel(QAbstractTableModel):
             self._rows.clear()
             self._addresses.clear()
             self._names.clear()
-            self._pending_names.clear()
+            self._last_seen.clear()
             self.endResetModel()

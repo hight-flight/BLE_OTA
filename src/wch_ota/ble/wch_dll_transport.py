@@ -58,9 +58,12 @@ class WchDllBinding:
 
     def __init__(self, dll_path: str | Path | None = None, *, library: Any = None) -> None:
         self._connection_callbacks: dict[int, Any] = {}
-        self._notify_buffers: dict[int, deque[bytes]] = {}
-        self._notify_callbacks: dict[int, Any] = {}
-        self._notify_modes: dict[int, str] = {}
+        # 原生 DLL 可能在打开失败或关闭返回后继续投递迟到事件，因此连接回调
+        # 与 binding 同寿命，不能释放仍可能被原生线程调用的函数指针。
+        self._retired_connection_callbacks: list[Any] = []
+        self._notify_buffers: dict[tuple[int, int], deque[bytes]] = {}
+        self._notify_callbacks: dict[tuple[int, int], Any] = {}
+        self._notify_modes: dict[tuple[int, int], str] = {}
         self._notify_lock = threading.Lock()
         self._advertising_callback: Any | None = None
         if library is not None:
@@ -167,6 +170,7 @@ class WchDllBinding:
             device_id.encode("mbcs"), False, native_callback
         )
         if not handle:
+            self._retired_connection_callbacks.append(native_callback)
             raise TransportError("WCHBLEOpenDevice 返回空句柄")
         self._connection_callbacks[_handle_key(handle)] = native_callback
         return handle
@@ -188,13 +192,16 @@ class WchDllBinding:
 
         handle = open_by_address(raw_address, False, native_callback)
         if not handle:
+            self._retired_connection_callbacks.append(native_callback)
             raise TransportError("WCHBLEOpenDeviceAddress 返回空句柄")
         self._connection_callbacks[_handle_key(handle)] = native_callback
         return handle
 
     def close_device(self, handle: Any) -> None:
         self._dll.WCHBLECloseDevice(handle)
-        self._connection_callbacks.pop(_handle_key(handle), None)
+        callback = self._connection_callbacks.pop(_handle_key(handle), None)
+        if callback is not None:
+            self._retired_connection_callbacks.append(callback)
 
     def list_characteristics(self, handle: Any) -> list[int]:
         uuids = (ctypes.c_ushort * 64)()
@@ -215,13 +222,14 @@ class WchDllBinding:
         必须传入真正的回调指针；早期实现误把结果缓冲区当回调传入，导致订阅无效、
         设备回送的通知被 DLL 直接丢弃，主机永远读不到擦除完成响应。
         """
+        key = (_handle_key(handle), characteristic_uuid)
         c_callback = _READ_CALLBACK(
-            lambda param_inf, buf, length: self._on_notify(characteristic_uuid, buf, length)
+            lambda param_inf, buf, length: self._on_notify(key, buf, length)
         )
         with self._notify_lock:
-            self._notify_buffers.setdefault(characteristic_uuid, deque())
-            self._notify_callbacks[characteristic_uuid] = c_callback
-            self._notify_modes[characteristic_uuid] = "notify"
+            self._notify_buffers[key] = deque()
+            self._notify_callbacks[key] = c_callback
+            self._notify_modes[key] = "notify"
         status = self._dll.WCHBLERegisterReadNotify(
             handle,
             0xFEE0,
@@ -239,13 +247,14 @@ class WchDllBinding:
         部分设备 OTA 特征以 indicate 而非 notify 上报响应；DLL 按属性位拒绝
         notify 订阅时，可改用 indicate 订阅作为回退。
         """
+        key = (_handle_key(handle), characteristic_uuid)
         c_callback = _READ_CALLBACK(
-            lambda param_inf, buf, length: self._on_notify(characteristic_uuid, buf, length)
+            lambda param_inf, buf, length: self._on_notify(key, buf, length)
         )
         with self._notify_lock:
-            self._notify_buffers.setdefault(characteristic_uuid, deque())
-            self._notify_callbacks[characteristic_uuid] = c_callback
-            self._notify_modes[characteristic_uuid] = "indicate"
+            self._notify_buffers[key] = deque()
+            self._notify_callbacks[key] = c_callback
+            self._notify_modes[key] = "indicate"
         status = self._dll.WCHBLERegisterReadIndicate(
             handle,
             0xFEE0,
@@ -257,12 +266,12 @@ class WchDllBinding:
 
     def read_notify(self, handle: Any, characteristic_uuid: int) -> bytes:
         """取出并清空某特征缓存的通知数据。"""
-        del handle
+        key = (_handle_key(handle), characteristic_uuid)
         with self._notify_lock:
-            frames = self._notify_buffers.get(characteristic_uuid)
+            frames = self._notify_buffers.get(key)
             return frames.popleft() if frames else b""
 
-    def _on_notify(self, characteristic_uuid: int, buf: Any, length: int) -> None:
+    def _on_notify(self, key: tuple[int, int], buf: Any, length: int) -> None:
         if not buf or not length:
             return
         try:
@@ -270,13 +279,14 @@ class WchDllBinding:
         except Exception:
             return
         with self._notify_lock:
-            frames = self._notify_buffers.get(characteristic_uuid)
+            frames = self._notify_buffers.get(key)
             if frames is not None:
                 frames.append(data)
 
     def unregister_read_notify(self, handle: Any, characteristic_uuid: int) -> None:
+        key = (_handle_key(handle), characteristic_uuid)
         with self._notify_lock:
-            mode = self._notify_modes.get(characteristic_uuid, "notify")
+            mode = self._notify_modes.get(key, "notify")
         unregister = (
             self._dll.WCHBLERegisterReadIndicate
             if mode == "indicate"
@@ -287,9 +297,9 @@ class WchDllBinding:
             return
         # 必须在 DLL 注销成功后再释放 CFUNCTYPE，避免原生线程调用悬空指针。
         with self._notify_lock:
-            self._notify_callbacks.pop(characteristic_uuid, None)
-            self._notify_modes.pop(characteristic_uuid, None)
-            self._notify_buffers.pop(characteristic_uuid, None)
+            self._notify_callbacks.pop(key, None)
+            self._notify_modes.pop(key, None)
+            self._notify_buffers.pop(key, None)
 
     def get_mtu(self, handle: Any) -> int:
         mtu = ctypes.c_ushort()
@@ -580,6 +590,8 @@ class WchDllTransport:
     # 模式仍会快速返回，不能作为可靠背压，因此保持 Android 的无响应写入方式。
     verify_packet_delay = 0.012
     device_id_resolution_attempts = 3
+    gatt_discovery_attempts = 6
+    gatt_discovery_retry_delay = 0.25
 
     def __init__(
         self,
@@ -761,7 +773,6 @@ class WchDllTransport:
             await self._stop_scan_locked()
 
     async def _stop_scan_locked(self) -> None:
-        self._scan_active = False
         if self._native_scan_active:
             unregister_notify = getattr(
                 self._binding, "unregister_advertising_notify", None
@@ -772,6 +783,7 @@ class WchDllTransport:
                     raise TransportError("注销实时广播扫描失败，可重试停止扫描")
             self._native_scan_active = False
             self._trace("WCH DLL 实时广播扫描已停止")
+        self._scan_active = False
         self._scan_event_loop = None
         task = self._scan_task
         self._scan_task = None
@@ -830,10 +842,29 @@ class WchDllTransport:
                     f"耗时={self._elapsed_ms(started):.1f} ms"
                 )
                 characteristic_started = perf_counter()
-                has_ota = await self._call_binding(
-                    self._binding.has_ota_characteristic, handle
-                )
+                has_ota = False
+                discovery_error: Exception | None = None
+                for attempt in range(1, self.gatt_discovery_attempts + 1):
+                    if self._handle is not handle:
+                        raise TransportError("连接初始化期间设备已断开")
+                    try:
+                        has_ota = bool(
+                            await self._call_binding(
+                                self._binding.has_ota_characteristic, handle
+                            )
+                        )
+                        discovery_error = None
+                    except Exception as error:
+                        discovery_error = error
+                    if has_ota:
+                        break
+                    if attempt < self.gatt_discovery_attempts:
+                        await asyncio.sleep(self.gatt_discovery_retry_delay)
                 if not has_ota:
+                    if discovery_error is not None:
+                        raise TransportError(
+                            f"发现 OTA 特征 FEE1 失败：{discovery_error}"
+                        ) from discovery_error
                     raise TransportError("设备缺少 OTA 特征 FEE1")
                 self._trace(
                     "WCH DLL 特征检查：FEE0/FEE1=存在；"
@@ -906,12 +937,12 @@ class WchDllTransport:
         errors: list[str] = []
         if device.device_id:
             try:
-                generation, connection_callback = connection_callback_factory()
-                handle = await self._call_binding(
-                    self._binding.open_device, device.device_id, connection_callback
+                handle, generation = await self._open_connection_attempt(
+                    self._binding.open_device,
+                    (device.device_id,),
+                    connection_callback_factory,
+                    "WCHBLEOpenDevice 返回空句柄",
                 )
-                if not handle:
-                    raise TransportError("WCHBLEOpenDevice 返回空句柄")
                 return handle, generation
             except Exception as device_id_error:
                 errors.append(f"Device ID 连接失败：{device_id_error}")
@@ -927,12 +958,12 @@ class WchDllTransport:
             not device.device_id or self._native_scan_active
         ):
             try:
-                generation, connection_callback = connection_callback_factory()
-                handle = await self._call_binding(
-                    open_by_address, address, connection_callback
+                handle, generation = await self._open_connection_attempt(
+                    open_by_address,
+                    (address,),
+                    connection_callback_factory,
+                    "WCHBLEOpenDeviceAddress 返回空句柄",
                 )
-                if not handle:
-                    raise TransportError("WCHBLEOpenDeviceAddress 返回空句柄")
                 if device.device_id:
                     self._trace("WCH DLL 已从 Device ID 连接回退为 MAC 地址连接")
                 return handle, generation
@@ -946,6 +977,7 @@ class WchDllTransport:
                 await self.stop_scan()
             except Exception as stop_error:
                 errors.append(f"停止扫描失败：{stop_error}")
+                raise TransportError("；".join(errors)) from stop_error
         resolved = None
         for attempt in range(1, self.device_id_resolution_attempts + 1):
             records = await self._call_binding(
@@ -973,18 +1005,36 @@ class WchDllTransport:
             self._trace(
                 f"WCH DLL 使用重新扫描取得的 Device ID 重试：{resolved.device_id}"
             )
-            generation, connection_callback = connection_callback_factory()
-            handle = await self._call_binding(
+            handle, generation = await self._open_connection_attempt(
                 self._binding.open_device,
-                resolved.device_id,
-                connection_callback,
+                (resolved.device_id,),
+                connection_callback_factory,
+                "WCHBLEOpenDevice 返回空句柄",
             )
-            if not handle:
-                raise TransportError("WCHBLEOpenDevice 返回空句柄")
             return handle, generation
         except Exception as refreshed_id_error:
             errors.append(f"最新 Device ID 连接失败：{refreshed_id_error}")
             raise TransportError("；".join(errors)) from refreshed_id_error
+
+    async def _open_connection_attempt(
+        self,
+        opener: Any,
+        arguments: tuple[Any, ...],
+        connection_callback_factory: Any,
+        empty_handle_message: str,
+    ) -> tuple[Any, int]:
+        generation, connection_callback = connection_callback_factory()
+        handle = await self._call_binding(opener, *arguments, connection_callback)
+        if not handle:
+            raise TransportError(empty_handle_message)
+        # 原生回调可能在 DLL 打开函数返回前到达；让事件循环先处理它，早期
+        # 断开视为本次尝试失败，以便继续 MAC 或最新 Device ID 回退。
+        await asyncio.sleep(0)
+        if self._pending_connection_state == (generation, False):
+            await self._call_binding(self._binding.close_device, handle)
+            self._pending_connection_state = None
+            raise TransportError("连接建立期间设备已断开")
+        return handle, generation
 
     async def write_ota(self, payload: bytes, *, response: bool = False) -> None:
         handle = self._require_handle()

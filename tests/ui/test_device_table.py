@@ -78,7 +78,7 @@ def test_device_table_does_not_replace_complete_name_with_shorter_name():
     assert model.data(model.index(0, 0), Qt.DisplayRole) == "JGS_CHICKEN"
 
 
-def test_device_table_accepts_repeated_shorter_name_as_an_actual_rename():
+def test_device_table_keeps_complete_name_when_short_name_repeats():
     model = DeviceTableModel()
     address = "AA:BB"
     model.update_device(Device("JGS_CHICKEN", address), Advertisement(None, -50))
@@ -86,7 +86,21 @@ def test_device_table_accepts_repeated_shorter_name_as_an_actual_rename():
     for _ in range(3):
         model.update_device(Device("CHICKEN", address), Advertisement("CHICKEN", -45))
 
-    assert model.data(model.index(0, 0), Qt.DisplayRole) == "CHICKEN"
+    assert model.data(model.index(0, 0), Qt.DisplayRole) == "JGS_CHICKEN"
+
+
+def test_device_table_removes_devices_not_seen_within_maximum_age():
+    now = [100.0]
+    model = DeviceTableModel(clock=lambda: now[0])
+    model.update_device(Device("旧设备", "AA:BB"), Advertisement(None, -70))
+    now[0] += 16.0
+    model.update_device(Device("活动设备", "CC:DD"), Advertisement(None, -40))
+
+    removed = model.prune_stale(max_age_seconds=15.0)
+
+    assert removed == 1
+    assert model.rowCount() == 1
+    assert model.data(model.index(0, 1), Qt.DisplayRole) == "CC:DD"
 
 
 def test_device_table_reads_complete_name_from_raw_scan_response():

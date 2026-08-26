@@ -232,7 +232,7 @@ async def test_erase_matches_android_no_response_write_even_when_ack_is_supporte
 async def test_empty_no_response_erase_retries_same_android_frame_with_response() -> None:
     events = []
     command = build_erase_command(
-        0x1000, 1, ChipType.CH583, target_image=ImageType.A
+        0x1000, 15, ChipType.CH583, target_image=ImageType.A
     )
     transport = FakeTransport(
         responses=(
@@ -308,10 +308,10 @@ async def test_compact_erase_fallback_continues_upgrade_after_valid_info_probe()
     assert transport.writes[:4] == [
         build_info_command(),
         build_erase_command(
-            0x1000, 1, ChipType.CH583, target_image=ImageType.A
+            0x1000, 15, ChipType.CH583, target_image=ImageType.A
         ),
         build_info_command(),
-        build_compact_erase_command(0x1000, 1, ChipType.CH583),
+        build_compact_erase_command(0x1000, 15, ChipType.CH583),
     ]
     assert [packet[0] for packet in transport.writes[4:]] == [0x80, 0x82, 0x83]
     assert any("6 字节兼容帧" in event.message for event in events)
@@ -339,7 +339,7 @@ async def test_erase_does_not_treat_changed_info_as_success() -> None:
     assert transport.writes[:3] == [
         build_info_command(),
         build_erase_command(
-            0x1000, 1, ChipType.CH583, target_image=ImageType.A
+            0x1000, 15, ChipType.CH583, target_image=ImageType.A
         ),
         build_info_command(),
     ]
@@ -369,11 +369,11 @@ async def test_erase_confirmed_complete_when_probe_info_matches_baseline_only_af
     assert transport.writes[:4] == [
         build_info_command(),
         build_erase_command(
-            0x1000, 1, ChipType.CH583, target_image=ImageType.A
+            0x1000, 15, ChipType.CH583, target_image=ImageType.A
         ),
         build_info_command(),
         build_erase_command(
-            0x1000, 1, ChipType.CH583, target_image=ImageType.A
+            0x1000, 15, ChipType.CH583, target_image=ImageType.A
         ),
     ]
     assert any("有响应写入" in event.message for event in events)
@@ -586,6 +586,25 @@ def test_iap_preflight_uses_manual_address_without_ab_capacity_limit() -> None:
     assert controller._preflight(firmware, info, start_address) == 2
 
 
+def test_preflight_erases_every_block_touched_by_padded_final_packet() -> None:
+    transport = FakeTransport(mtu=247)
+    controller = OtaController(transport, sleep=no_sleep)
+    firmware = FirmwareImage(0, bytes(4096))
+    info = CurrentImageInfo(ChipType.CH583, ImageType.IAP, 0, 4096)
+
+    assert controller._preflight(firmware, info, 0) == 2
+
+
+def test_preflight_rejects_padding_that_crosses_target_image_capacity() -> None:
+    transport = FakeTransport(mtu=247)
+    controller = OtaController(transport, sleep=no_sleep)
+    firmware = FirmwareImage(0, bytes(4096))
+    info = CurrentImageInfo(ChipType.CH583, ImageType.A, 4096, 4096)
+
+    with pytest.raises(OtaError, match="补齐后大小.*超过目标 Image"):
+        controller._preflight(firmware, info, 0)
+
+
 def test_ch579_rejects_iap_target() -> None:
     controller = OtaController(FakeTransport(), sleep=no_sleep)
     info = CurrentImageInfo(ChipType.CH579, ImageType.IAP, 0x1200, 256)
@@ -609,7 +628,7 @@ async def test_iap_erase_failure_never_falls_back_to_frame_without_image_flag() 
 
     assert transport.writes == [
         build_info_command(),
-        build_erase_command(0, 2, ChipType.CH583, target_image=ImageType.IAP),
+        build_erase_command(0, 15, ChipType.CH583, target_image=ImageType.IAP),
         build_info_command(),
     ]
 
