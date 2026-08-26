@@ -6,6 +6,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_fake_x64_dll(path: Path) -> None:
+    content = bytearray(0x88)
+    content[:2] = b"MZ"
+    content[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    content[0x80:0x84] = b"PE\0\0"
+    content[0x84:0x86] = (0x8664).to_bytes(2, "little")
+    path.write_bytes(content)
+
+
 def test_windows_build_script_validates_and_packages_directory_distribution() -> None:
     script = (PROJECT_ROOT / "build_exe.cmd").read_text(encoding="utf-8")
     normalized = script.lower()
@@ -37,7 +46,7 @@ def test_python_build_script_runs_tests_then_pyinstaller(tmp_path) -> None:
     module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
     module.ONEFILE_OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
     module.ONEFILE_SPEC_FILE.write_text("# test spec", encoding="utf-8")
-    module.WCH_DLL.write_bytes(b"dll")
+    _write_fake_x64_dll(module.WCH_DLL)
 
     commands: list[list[str]] = []
 
@@ -79,7 +88,7 @@ def test_python_build_script_can_skip_tests(tmp_path) -> None:
     module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
     module.ONEFILE_OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
     module.ONEFILE_SPEC_FILE.write_text("# test spec", encoding="utf-8")
-    module.WCH_DLL.write_bytes(b"dll")
+    _write_fake_x64_dll(module.WCH_DLL)
 
     commands: list[list[str]] = []
 
@@ -102,7 +111,7 @@ def test_python_build_script_can_build_directory_distribution(tmp_path) -> None:
         tmp_path / "dist" / "WCH-BLE-OTA" / "WCH-BLE-OTA.exe"
     )
     module.DIRECTORY_SPEC_FILE.write_text("# test spec", encoding="utf-8")
-    module.WCH_DLL.write_bytes(b"dll")
+    _write_fake_x64_dll(module.WCH_DLL)
     commands: list[list[str]] = []
 
     def fake_runner(command: list[str]) -> None:
@@ -122,3 +131,23 @@ def test_python_build_script_defaults_to_onefile_cli_mode() -> None:
     assert module._parse_args([]).onefile is True
     assert module._parse_args(["--onefile"]).onefile is True
     assert module._parse_args(["--directory"]).onefile is False
+
+
+def test_python_build_script_rejects_x86_wch_dll(tmp_path) -> None:
+    module = _load_python_build_script()
+    module.ONEFILE_SPEC_FILE = tmp_path / "wch-ota-onefile.spec"
+    module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
+    module.ONEFILE_SPEC_FILE.write_text("# test spec", encoding="utf-8")
+    content = bytearray(0x88)
+    content[:2] = b"MZ"
+    content[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    content[0x80:0x84] = b"PE\0\0"
+    content[0x84:0x86] = (0x014C).to_bytes(2, "little")
+    module.WCH_DLL.write_bytes(content)
+
+    try:
+        module._validate_inputs(module.ONEFILE_SPEC_FILE)
+    except RuntimeError as error:
+        assert "x64" in str(error)
+    else:
+        raise AssertionError("x86 DLL 应被构建检查拒绝")

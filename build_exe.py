@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,27 @@ def _validate_inputs(spec_file: Path) -> None:
         raise FileNotFoundError(f"未找到 PyInstaller 配置：{spec_file}")
     if not WCH_DLL.is_file():
         raise FileNotFoundError(f"未找到 WCH 蓝牙 DLL：{WCH_DLL}")
+    if struct.calcsize("P") != 8:
+        raise RuntimeError("WCHBLEDLL_v15.dll 仅支持 x64，请使用 64 位 Python 构建")
+    if _read_pe_machine(WCH_DLL) != 0x8664:
+        raise RuntimeError("WCHBLEDLL_v15.dll 不是 x64 DLL，已停止构建")
+
+
+def _read_pe_machine(path: Path) -> int:
+    """读取 PE COFF Machine 字段，构建前阻止 DLL 与 Python 架构不匹配。"""
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(64)
+            if len(header) < 64 or header[:2] != b"MZ":
+                raise ValueError("缺少 MZ 文件头")
+            pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+            stream.seek(pe_offset)
+            pe_header = stream.read(6)
+            if len(pe_header) != 6 or pe_header[:4] != b"PE\0\0":
+                raise ValueError("缺少 PE 文件头")
+            return int.from_bytes(pe_header[4:6], "little")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"无法校验 WCH 蓝牙 DLL 架构：{error}") from error
 
 
 def build(

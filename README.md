@@ -39,13 +39,19 @@ python -m wch_ota
 python -m pytest -v
 ```
 
-生成 Windows 目录型发布包：
+使用当前 Python 环境生成 Windows 发布包：
 
 ```powershell
-pyinstaller packaging/wch-ota.spec --noconfirm
+python build_exe.py
 ```
 
-产物位于 `dist/WCH-BLE-OTA/`。本项目刻意使用目录型发布，避免单文件模式每次启动时解压运行时所带来的等待。
+默认生成单文件 `dist/WCH-BLE-OTA.exe`。如需目录型发布包，执行：
+
+```powershell
+python build_exe.py --directory
+```
+
+目录型产物位于 `dist/WCH-BLE-OTA/`。单文件模式启动时会解压到系统临时目录；如果其他电脑被杀毒软件、AppLocker 或企业策略阻止，可改用目录型发布包进行兼容性验证。
 
 ## 使用步骤
 

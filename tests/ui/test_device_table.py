@@ -16,6 +16,7 @@ class Device:
 class Advertisement:
     local_name: str | None
     rssi: int
+    name_priority: int = 30
 
 
 def test_device_table_deduplicates_by_address_and_keeps_original_device():
@@ -72,8 +73,10 @@ def test_device_table_preserves_device_id_when_live_packet_has_no_device_id():
 def test_device_table_does_not_replace_complete_name_with_shorter_name():
     model = DeviceTableModel()
 
-    model.update_device(Device("JGS_CHICKEN", "AA:BB"), Advertisement(None, -50))
-    model.update_device(Device("CHICKEN", "AA:BB"), Advertisement("CHICKEN", -45))
+    model.update_device(
+        Device("JGS_CHICKEN", "AA:BB"), Advertisement("JGS_CHICKEN", -50, 40)
+    )
+    model.update_device(Device("CHICKEN", "AA:BB"), Advertisement("CHICKEN", -45, 20))
 
     assert model.data(model.index(0, 0), Qt.DisplayRole) == "JGS_CHICKEN"
 
@@ -81,12 +84,27 @@ def test_device_table_does_not_replace_complete_name_with_shorter_name():
 def test_device_table_keeps_complete_name_when_short_name_repeats():
     model = DeviceTableModel()
     address = "AA:BB"
-    model.update_device(Device("JGS_CHICKEN", address), Advertisement(None, -50))
+    model.update_device(
+        Device("JGS_CHICKEN", address), Advertisement("JGS_CHICKEN", -50, 40)
+    )
 
     for _ in range(3):
-        model.update_device(Device("CHICKEN", address), Advertisement("CHICKEN", -45))
+        model.update_device(
+            Device("CHICKEN", address), Advertisement("CHICKEN", -45, 20)
+        )
 
     assert model.data(model.index(0, 0), Qt.DisplayRole) == "JGS_CHICKEN"
+
+
+def test_device_table_prefers_new_complete_advertising_name_over_long_cached_name():
+    model = DeviceTableModel()
+    model.update_device(
+        Device("Simple Peripheral", "AA:BB"), Advertisement(None, -50)
+    )
+
+    model.update_device(Device("JGS_1.4", "AA:BB"), Advertisement("JGS_1.4", -45, 40))
+
+    assert model.data(model.index(0, 0), Qt.DisplayRole) == "JGS_1.4"
 
 
 def test_device_table_removes_devices_not_seen_within_maximum_age():

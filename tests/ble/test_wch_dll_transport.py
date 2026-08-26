@@ -14,7 +14,9 @@ from wch_ota.ble.wch_dll_transport import (
     WchDllBinding,
     WchDllTransport,
     _ADVERTISING_SNAPSHOT_SIZE,
+    _decode_native_string,
     _default_dll_path,
+    _verify_dll_abi,
     _parse_advertising_snapshot,
 )
 
@@ -136,9 +138,14 @@ class FakeRawDll:
         self.read_result = b"\x02\x00"
         self.write_status = 0
         self.notification_registrations = []
+        self.open_timeouts = []
 
     def WCHBLEInit(self) -> None:
         self.initialized = True
+
+    def WCHBLESetOpenTimeOut(self, timeout_ms) -> bool:
+        self.open_timeouts.append(int(getattr(timeout_ms, "value", timeout_ms)))
+        return True
 
     def WCHBLEIsBluetoothOpened(self) -> bool:
         return True
@@ -222,6 +229,26 @@ def test_default_binding_uses_official_v15_dll() -> None:
     assert _default_dll_path().name == "WCHBLEDLL_v15.dll"
 
 
+def test_native_device_name_prefers_utf8_before_windows_code_page() -> None:
+    value = bytearray(260)
+    encoded = "设备名称".encode("utf-8")
+    value[: len(encoded)] = encoded
+
+    assert _decode_native_string(value) == "设备名称"
+
+
+def test_official_dll_abi_guard_accepts_bundled_binary() -> None:
+    _verify_dll_abi(_default_dll_path())
+
+
+def test_official_dll_abi_guard_rejects_replaced_binary(tmp_path) -> None:
+    replaced = tmp_path / "WCHBLEDLL_v15.dll"
+    replaced.write_bytes(_default_dll_path().read_bytes() + b"modified")
+
+    with pytest.raises(TransportError, match="版本或内容不匹配"):
+        _verify_dll_abi(replaced)
+
+
 @pytest.mark.asyncio
 async def test_default_scan_window_returns_results_within_one_second() -> None:
     class ScanDurationBinding(FakeBinding):
@@ -267,6 +294,37 @@ async def test_default_continuous_scan_uses_long_window_to_find_slow_devices() -
 
 
 @pytest.mark.asyncio
+async def test_live_scan_periodically_enumerates_devices_as_driver_watchdog() -> None:
+    class SilentLiveScanBinding(FakeBinding):
+        @property
+        def supports_live_scan(self) -> bool:
+            return True
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            return True
+
+        def open_device_address(self, _address: str, _callback):
+            return self.handle
+
+    binding = SilentLiveScanBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=10)
+    transport.live_scan_watchdog_interval = 0
+    transport.live_scan_watchdog_duration_ms = 1
+
+    await transport.start_scan(lambda _device, _advertisement: None)
+    for _ in range(50):
+        if binding.enumerate_calls >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await transport.stop_scan()
+
+    assert binding.enumerate_calls >= 2
+
+
+@pytest.mark.asyncio
 async def test_scan_uses_dll_name_and_normalized_mac_address() -> None:
     binding = FakeBinding()
     transport = WchDllTransport(binding=binding, scan_duration_ms=10)
@@ -284,6 +342,7 @@ async def test_scan_uses_dll_name_and_normalized_mac_address() -> None:
     assert device.address == "DC:32:62:1A:FD:22"
     assert advertisement.local_name == "JGS_CHICKEN_1.4.04"
     assert advertisement.rssi == -51
+    assert advertisement.name_priority == 10
 
 
 @pytest.mark.asyncio
@@ -371,6 +430,7 @@ def test_parses_live_advertising_name_mac_and_rssi() -> None:
     assert record.name == "JGS_CHICKEN_1.4.04"
     assert record.rssi == -47
     assert record.device_id == ""
+    assert record.name_priority == 40
 
 
 def test_binding_registers_and_unregisters_live_advertising_callback() -> None:
@@ -566,6 +626,42 @@ def test_binding_keeps_failed_native_connection_callback_alive() -> None:
         )
 
     assert raw.failed_callback in binding._retired_connection_callbacks
+
+
+def test_binding_empty_handle_includes_native_error_details() -> None:
+    class EmptyHandleDll(FakeRawDll):
+        def WCHBLEOpenDevice(self, _device_id, _is_cache_mode, callback):
+            self.connection_callback = callback
+            return None
+
+    binding = WchDllBinding(library=EmptyHandleDll())
+
+    with pytest.raises(TransportError) as caught:
+        binding.open_device("device-id", lambda _handle, _state: None)
+
+    assert "SDK=10" in str(caught.value)
+    assert "OS=0x80070005" in str(caught.value)
+
+
+def test_binding_configures_native_open_timeout_during_initialization() -> None:
+    raw = FakeRawDll()
+    binding = WchDllBinding(library=raw, open_timeout_ms=12_000)
+
+    binding.initialize()
+
+    assert raw.open_timeouts == [12_000]
+
+
+def test_binding_reports_rejected_native_open_timeout() -> None:
+    class TimeoutRejectedDll(FakeRawDll):
+        def WCHBLESetOpenTimeOut(self, timeout_ms) -> bool:
+            self.open_timeouts.append(int(getattr(timeout_ms, "value", timeout_ms)))
+            return False
+
+    binding = WchDllBinding(library=TimeoutRejectedDll())
+
+    with pytest.raises(TransportError, match="连接超时"):
+        binding.initialize()
 
 
 def test_binding_retires_native_connection_callback_after_close() -> None:
@@ -1118,7 +1214,36 @@ def test_binding_unregisters_indicate_before_releasing_callback() -> None:
     assert mode == "indicate"
     assert characteristic == 0xFEE1
     assert callback is None
-    assert 0xFEE1 not in binding._notify_callbacks
+    assert (raw.handle, 0xFEE1) not in binding._notify_callbacks
+
+
+def test_binding_retires_notify_callback_after_successful_unregister() -> None:
+    raw = FakeRawDll()
+    binding = WchDllBinding(library=raw)
+    binding.register_read_notify(raw.handle, 0xFEE1)
+    callback = raw.notification_registrations[-1][2]
+
+    binding.unregister_read_notify(raw.handle, 0xFEE1)
+
+    assert callback in binding._retired_notify_callbacks
+
+
+def test_late_notify_from_reused_handle_does_not_pollute_new_connection() -> None:
+    raw = FakeRawDll()
+    binding = WchDllBinding(library=raw)
+    binding.register_read_notify(raw.handle, 0xFEE1)
+    old_callback = raw.notification_registrations[-1][2]
+    binding.unregister_read_notify(raw.handle, 0xFEE1)
+    binding.register_read_notify(raw.handle, 0xFEE1)
+    current_callback = raw.notification_registrations[-1][2]
+
+    stale = ctypes.create_string_buffer(b"\x05\x00")
+    current = ctypes.create_string_buffer(b"\x00\x00")
+    old_callback(None, stale, 2)
+    current_callback(None, current, 2)
+
+    assert binding.read_notify(raw.handle, 0xFEE1) == b"\x00\x00"
+    assert binding.read_notify(raw.handle, 0xFEE1) == b""
 
 
 def test_notification_buffers_are_isolated_by_connection_handle() -> None:
@@ -1158,6 +1283,45 @@ async def test_transport_subscribes_fee1_and_falls_back_to_fee2_gatt_read() -> N
     assert any("订阅 0xFEE1 通知" in trace for trace in traces)
     # 通知缓冲为空时，回退到 GATT 读取（FEE2 可读值兜底）。
     assert await transport.read_ota() == b"\x00"
+
+
+@pytest.mark.asyncio
+async def test_initialization_trace_contains_runtime_diagnostics() -> None:
+    traces = []
+    transport = WchDllTransport(binding=FakeBinding(), trace_callback=traces.append)
+
+    await transport.start_scan(lambda _device, _advertisement: None)
+    await transport.stop_scan()
+
+    assert any("进程=" in trace and "连接超时=" in trace for trace in traces)
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_scans_emit_windows_environment_hint() -> None:
+    binding = FakeBinding()
+    binding.records = []
+    traces = []
+    transport = WchDllTransport(binding=binding, trace_callback=traces.append)
+
+    for _ in range(3):
+        await transport._scan_once(lambda _device, _advertisement: None, scan_duration_ms=1)
+
+    assert any(
+        "Bluetooth Support Service" in trace and "驱动" in trace for trace in traces
+    )
+
+
+def test_live_advertising_resets_empty_compatibility_scan_counter() -> None:
+    transport = WchDllTransport(binding=FakeBinding())
+    transport._scan_active = True
+    transport._scan_callback = lambda _device, _advertisement: None
+    transport._empty_scan_cycles = 2
+
+    transport._dispatch_advertising_record(
+        Record("OTA", "", "DC:32:62:1A:FD:22", -45)
+    )
+
+    assert transport._empty_scan_cycles == 0
 
 
 @pytest.mark.asyncio
@@ -1208,6 +1372,39 @@ async def test_transport_keeps_gatt_read_fallback_when_both_subscriptions_fail()
     assert binding.notify_subscriptions == [0xFEE1]
     assert binding.indicate_subscriptions == [0xFEE1]
     assert await transport.read_ota() == b"\x00\x00"
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_unregisters_notify_before_closing_handle() -> None:
+    class MtuFailureBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_events = []
+
+        def get_mtu(self, handle) -> int:
+            raise TransportError("读取 MTU 失败")
+
+        def unregister_read_notify(self, handle, characteristic_uuid: int) -> None:
+            self.cleanup_events.append(("unregister", characteristic_uuid))
+            super().unregister_read_notify(handle, characteristic_uuid)
+
+        def close_device(self, handle) -> None:
+            self.cleanup_events.append(("close", handle))
+            super().close_device(handle)
+
+    binding = MtuFailureBinding()
+    transport = WchDllTransport(binding=binding)
+
+    with pytest.raises(TransportError, match="读取 MTU 失败"):
+        await transport.connect(
+            WchDevice("OTA", "DC:32:62:1A:FD:22", binding.records[0].device_id)
+        )
+
+    assert binding.cleanup_events[:2] == [
+        ("unregister", 0xFEE1),
+        ("unregister", 0xFEE2),
+    ]
+    assert binding.cleanup_events[-1] == ("close", binding.handle)
 
 
 def test_transport_uses_conservative_program_and_verify_pacing_without_sync_reads() -> None:

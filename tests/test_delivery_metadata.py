@@ -18,6 +18,7 @@ def test_readme_and_project_metadata_use_pyside6_bleak_stack() -> None:
     assert "pyinstaller>=6" in metadata["project"]["optional-dependencies"]["dev"]
     assert metadata["tool"]["pytest"]["ini_options"]["qt_api"] == "pyside6"
     assert metadata["project"]["scripts"]["wch-ota"] == "wch_ota.__main__:main"
+    assert metadata["project"]["version"] == "1.0.0"
     assert metadata["tool"]["setuptools"]["package-data"]["wch_ota.ble"] == [
         "WCHBLEDLL*.dll"
     ]
@@ -83,3 +84,11 @@ def test_gitignore_excludes_local_build_and_test_artifacts() -> None:
 
     for pattern in (".venv/", "build/", "dist/", "*.egg-info/", ".pytest_cache/"):
         assert pattern in ignored
+
+
+def test_readme_matches_python_builder_default_onefile_distribution() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "python build_exe.py" in readme
+    assert "默认生成单文件" in readme
+    assert "python build_exe.py --directory" in readme

@@ -25,6 +25,7 @@ class DeviceTableModel(QAbstractTableModel):
         self._rows: list[tuple[Any, Any]] = []
         self._addresses: dict[str, int] = {}
         self._names: dict[str, str] = {}
+        self._name_priorities: dict[str, int] = {}
         self._last_seen: dict[str, float] = {}
 
     def rowCount(self, parent=QModelIndex()) -> int:
@@ -53,21 +54,34 @@ class DeviceTableModel(QAbstractTableModel):
 
     def update_device(self, device: Any, advertisement: Any) -> None:
         address = normalize_device_address(getattr(device, "address", ""))
-        candidates = [
-            name.strip()
-            for name in (
-                getattr(advertisement, "local_name", None),
-                getattr(device, "name", None),
-                self._raw_local_name(advertisement),
+        candidates: list[tuple[int, str]] = []
+        advertising_name = getattr(advertisement, "local_name", None)
+        if isinstance(advertising_name, str) and advertising_name.strip():
+            candidates.append(
+                (
+                    int(getattr(advertisement, "name_priority", 30)),
+                    advertising_name.strip(),
+                )
             )
-            if isinstance(name, str) and name.strip()
-        ]
+        device_name = getattr(device, "name", None)
+        if isinstance(device_name, str) and device_name.strip():
+            candidates.append((10, device_name.strip()))
+        raw_candidate = self._raw_local_name(advertisement)
+        if raw_candidate is not None:
+            candidates.append(raw_candidate)
         if candidates:
-            current_name = max(candidates, key=len)
+            current_priority, current_name = max(
+                candidates, key=lambda candidate: (candidate[0], len(candidate[1]))
+            )
             previous_name = self._names.get(address, "")
-            # 同一扫描周期可能先后收到 Shortened/Complete Local Name，保留信息更完整者。
-            if len(current_name) >= len(previous_name):
+            previous_priority = self._name_priorities.get(address, -1)
+            # 广播 Complete Local Name 比 Windows 缓存名可信；同来源才按长度选优。
+            if current_priority > previous_priority or (
+                current_priority == previous_priority
+                and len(current_name) >= len(previous_name)
+            ):
                 self._names[address] = current_name
+                self._name_priorities[address] = current_priority
         self._last_seen[address] = self._clock()
         if address in self._addresses:
             row = self._addresses[address]
@@ -110,12 +124,13 @@ class DeviceTableModel(QAbstractTableModel):
         }
         for address in stale:
             self._names.pop(address, None)
+            self._name_priorities.pop(address, None)
             self._last_seen.pop(address, None)
         self.endResetModel()
         return len(stale)
 
     @staticmethod
-    def _raw_local_name(advertisement: Any) -> str | None:
+    def _raw_local_name(advertisement: Any) -> tuple[int, str] | None:
         """从 Windows 原始 ADV/Scan Response 中补取 0x08/0x09 设备名。"""
         platform_data = getattr(advertisement, "platform_data", ())
         if len(platform_data) < 2:
@@ -136,14 +151,14 @@ class DeviceTableModel(QAbstractTableModel):
         except (ImportError, AttributeError):
             name_types = (9, 8)
 
-        names: list[str] = []
+        names: list[tuple[int, str]] = []
         for packet in raw_packets:
             native_advertisement = getattr(packet, "advertisement", None)
             if native_advertisement is None:
                 continue
             native_name = getattr(native_advertisement, "local_name", None)
             if isinstance(native_name, str) and native_name.strip():
-                names.append(native_name.strip())
+                names.append((30, native_name.strip()))
             get_sections = getattr(native_advertisement, "get_sections_by_type", None)
             if not callable(get_sections):
                 continue
@@ -154,8 +169,8 @@ class DeviceTableModel(QAbstractTableModel):
                     except (AttributeError, TypeError, UnicodeDecodeError):
                         continue
                     if decoded:
-                        names.append(decoded)
-        return max(names, key=len) if names else None
+                        names.append((40 if int(name_type) == 9 else 20, decoded))
+        return max(names, key=lambda candidate: (candidate[0], len(candidate[1]))) if names else None
 
     def device_at(self, row: int) -> Any | None:
         return self._rows[row][0] if 0 <= row < len(self._rows) else None
@@ -166,5 +181,6 @@ class DeviceTableModel(QAbstractTableModel):
             self._rows.clear()
             self._addresses.clear()
             self._names.clear()
+            self._name_priorities.clear()
             self._last_seen.clear()
             self.endResetModel()

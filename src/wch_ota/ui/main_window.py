@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from wch_ota import DISPLAY_VERSION
 from wch_ota.application.ota_events import OtaEvent, UpgradeStatus
 from wch_ota.domain.firmware import parse_firmware
 from wch_ota.domain.models import ChipType, ImageType
@@ -65,8 +66,13 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
         self._build_ui()
         self.setStyleSheet(BLUE_WHITE_STYLESHEET)
-        self.statusBar().setSizeGripEnabled(False)
-        self.statusBar().showMessage("WCH BLE OTA · 就绪")
+        status_bar = self.statusBar()
+        status_bar.setSizeGripEnabled(False)
+        status_bar.showMessage("WCH BLE OTA · 就绪")
+        self.version_label = QLabel(DISPLAY_VERSION, self)
+        self.version_label.setObjectName("versionLabel")
+        self.version_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        status_bar.addPermanentWidget(self.version_label)
         self.device_detected.connect(self._on_device_detected)
         self.ota_event_received.connect(self._on_ota_event)
         self.transport_disconnected.connect(self._on_transport_disconnected)

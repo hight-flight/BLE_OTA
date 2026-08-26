@@ -144,6 +144,8 @@ def test_reference_layout_compacts_controls_and_gives_log_more_space(window):
     assert widget.log_panel.isAncestorOf(widget.export_button)
     assert widget.log_panel.isAncestorOf(widget.clear_log_button)
     assert not widget.statusBar().isSizeGripEnabled()
+    assert widget.version_label.text() == "V1.0.0"
+    assert widget.statusBar().isAncestorOf(widget.version_label)
 
 
 def test_device_filter_matches_name_or_address(window, qtbot):
