@@ -33,7 +33,7 @@ _TARGET_IMAGE = {
 
 
 class MainWindow(QMainWindow):
-    device_detected = Signal(object, object)
+    device_detected = Signal(int, object, object)
     ota_event_received = Signal(object)
     transport_disconnected = Signal(object)
     transport_trace_received = Signal(str)
@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self._active_device: Any | None = None
         self._last_verified_device: Any | None = None
         self._scanning = False
+        self._scan_generation = 0
         self._upgrading = False
         self._connection_busy = False
         self._connection_lock = asyncio.Lock()
@@ -297,10 +298,15 @@ class MainWindow(QMainWindow):
         await self.start_upgrade()
 
     async def start_scan(self) -> None:
+        scan_generation = self._advance_scan_generation()
         self._set_scanning(True)
         try:
             self.device_model.clear()
-            await self.transport.start_scan(self._forward_scan_result)
+            await self.transport.start_scan(
+                lambda device, advertisement: self._forward_scan_result(
+                    scan_generation, device, advertisement
+                )
+            )
             self._append_log("开始扫描 BLE 设备")
         except Exception as error:
             self._set_scanning(False)
@@ -309,20 +315,38 @@ class MainWindow(QMainWindow):
             if not getattr(self.transport, "scan_is_continuous", True):
                 self._set_scanning(False)
 
-    def _forward_scan_result(self, device: Any, advertisement: Any) -> None:
+    def _advance_scan_generation(self) -> int:
+        """使已排队的旧扫描结果无法写入当前设备列表。"""
+        self._scan_generation += 1
+        return self._scan_generation
+
+    def _forward_scan_result(
+        self, scan_generation: int, device: Any, advertisement: Any
+    ) -> None:
         """用可检查签名的 Python 回调跨越 Bleak 与 Qt Signal 边界。"""
-        self.device_detected.emit(device, advertisement)
+        self.device_detected.emit(scan_generation, device, advertisement)
 
     async def stop_scan(self) -> None:
+        active_generation = self._scan_generation
+        self._advance_scan_generation()
         try:
             await self.transport.stop_scan()
             self._set_scanning(False)
             self._append_log("已停止扫描")
         except Exception as error:
+            self._scan_generation = active_generation
             self._report_error("停止扫描失败", error)
 
-    @Slot(object, object)
-    def _on_device_detected(self, device: Any, advertisement: Any) -> None:
+    @Slot(int, object, object)
+    def _on_device_detected(self, *args: Any) -> None:
+        if len(args) == 3:
+            scan_generation, device, advertisement = args
+            if scan_generation != self._scan_generation or not self._scanning:
+                return
+        elif len(args) == 2:
+            device, advertisement = args
+        else:
+            raise TypeError("扫描结果必须包含设备和广播数据")
         source_rows = self.device_model.rowCount()
         visible_rows = self.device_proxy.rowCount()
         self.device_model.update_device(device, advertisement)
@@ -467,7 +491,6 @@ class MainWindow(QMainWindow):
                     f"{properties or '属性未知'}；{write_mode}；"
                     f"MTU={mtu}"
                 )
-                await self.get_device_info()
             except Exception as error:
                 cleanup_error: Exception | None = None
                 if self.transport.is_connected:
@@ -491,6 +514,8 @@ class MainWindow(QMainWindow):
             finally:
                 self._connection_busy = False
                 self._refresh_controls()
+        if self._connected:
+            await self.get_device_info()
 
     def _ensure_connected_device_visible(self, device: Any) -> None:
         """重连不依赖扫描列表，但连接后必须恢复可操作的设备行。"""

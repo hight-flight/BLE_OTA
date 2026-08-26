@@ -48,6 +48,7 @@ class FakeTransport:
         self.read_calls = 0
         self.write_hook: Callable[[bytes], Awaitable[None]] | None = None
         self.write_error: Exception | None = None
+        self.discard_ota_responses_calls = 0
 
     async def write_ota(self, payload: bytes, *, response: bool = False) -> None:
         if self.write_error is not None:
@@ -61,6 +62,9 @@ class FakeTransport:
         del use_cached
         self.read_calls += 1
         return self.responses.pop(0) if self.responses else b""
+
+    async def discard_ota_responses(self) -> None:
+        self.discard_ota_responses_calls += 1
 
 
 def image_info(*, block_size: int = 16) -> CurrentImageInfo:
@@ -153,6 +157,26 @@ async def test_erase_retries_empty_reads_like_android_before_programming() -> No
     await OtaController(transport, sleep=no_sleep).upgrade(firmware, image_info())
 
     assert transport.read_calls == 5
+    assert [packet[0] for packet in transport.writes] == [
+        0x84,
+        0x81,
+        0x80,
+        0x82,
+        0x83,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_erase_ignores_late_info_response_before_its_ack() -> None:
+    transport = FakeTransport(
+        responses=[b"", info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+    )
+
+    await OtaController(transport, sleep=no_sleep).upgrade(
+        FirmwareImage(0, bytes(16)), image_info()
+    )
+
     assert [packet[0] for packet in transport.writes] == [
         0x84,
         0x81,
@@ -413,6 +437,17 @@ async def test_verify_ignores_stale_info_value_and_waits_for_status() -> None:
 
     assert events[-1].status is UpgradeStatus.SUCCESS
     assert transport.writes[-1] == build_end_command()
+
+
+@pytest.mark.asyncio
+async def test_verify_discards_residual_responses_before_writing_verify_packets() -> None:
+    transport = FakeTransport(responses=[b"\x00", b"\x00", b"\x00"])
+
+    await OtaController(transport, sleep=no_sleep).upgrade(
+        FirmwareImage(0, bytes(16)), image_info()
+    )
+
+    assert transport.discard_ota_responses_calls == 1
 
 
 @pytest.mark.asyncio
@@ -757,6 +792,26 @@ async def test_cancel_during_erase_wait_stops_before_reads_and_fallback_commands
     ]
     assert transport.read_calls == 1
     assert events[-1].status is UpgradeStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_final_verify_wait_is_reported_as_cancelled() -> None:
+    transport = FakeTransport(responses=[b"\x00", b"\x00"])
+    events = []
+    controller = None
+
+    async def cancel_during_final_verify_wait(delay: float) -> None:
+        if delay == 1:
+            controller.cancel()
+
+    controller = OtaController(
+        transport, events.append, sleep=cancel_during_final_verify_wait
+    )
+
+    await controller.upgrade(FirmwareImage(0, bytes(16)), image_info())
+
+    assert events[-1].status is UpgradeStatus.CANCELLED
+    assert [packet[0] for packet in transport.writes] == [0x84, 0x81, 0x80, 0x82]
 
 
 @pytest.mark.asyncio

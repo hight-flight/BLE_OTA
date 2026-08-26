@@ -113,6 +113,11 @@ class FakeBinding:
         assert handle is self.handle
         return self.read_results.get(characteristic_uuid, b"")
 
+    def discard_notify(self, handle, characteristic_uuid: int) -> None:
+        self._record_thread()
+        assert handle is self.handle
+        self.read_results.pop(characteristic_uuid, None)
+
     def unregister_read_notify(self, handle, characteristic_uuid: int) -> None:
         self._record_thread()
         assert handle is self.handle
@@ -919,6 +924,28 @@ async def test_connect_retries_gatt_discovery_until_device_is_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connect_preserves_discovery_error_and_resets_state_when_cleanup_fails() -> None:
+    class DiscoveryAndCloseFailureBinding(FakeBinding):
+        def has_ota_characteristic(self, _handle):
+            raise RuntimeError("服务发现失败")
+
+        def close_device(self, _handle):
+            raise RuntimeError("关闭句柄失败")
+
+    transport = WchDllTransport(binding=DiscoveryAndCloseFailureBinding())
+    transport.gatt_discovery_attempts = 1
+
+    with pytest.raises(TransportError, match="服务发现失败.*关闭句柄失败"):
+        await transport.connect(
+            WchDevice("OTA", "DC:32:62:1A:FD:22", "BluetoothLE#test")
+        )
+
+    assert not transport.is_connected
+    assert transport.effective_mtu == 23
+    assert transport.ota_characteristic_properties == ()
+
+
+@pytest.mark.asyncio
 async def test_failed_live_scan_unregistration_blocks_device_id_fallback() -> None:
     class StopFailureDuringFallbackBinding(FakeBinding):
         def __init__(self) -> None:
@@ -1103,6 +1130,18 @@ async def test_connect_read_write_and_disconnect_use_fee1_binding() -> None:
 
     assert binding.closed == [binding.handle]
     assert not transport.is_connected
+
+
+@pytest.mark.asyncio
+async def test_discarding_notifications_keeps_gatt_response_fallback_available() -> None:
+    binding = FakeBinding()
+    transport = WchDllTransport(binding=binding)
+    await transport.connect(
+        WchDevice("OTA", "DC:32:62:1A:FD:22", binding.records[0].device_id)
+    )
+    await transport.discard_ota_responses()
+
+    assert await transport.read_ota() == b"\x00\x00"
 
 
 @pytest.mark.asyncio

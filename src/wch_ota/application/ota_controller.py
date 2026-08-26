@@ -324,7 +324,7 @@ class OtaController:
             await self._sleep(settle_delay)
         if self._cancel_requested.is_set():
             return b""
-        return await self._read_nonempty_response(
+        return await self._read_erase_response(
             attempts=self._erase_read_attempts(),
             retry_delay=float(
                 getattr(
@@ -334,6 +334,20 @@ class OtaController:
                 )
             ),
         )
+
+    async def _read_erase_response(
+        self, *, attempts: int, retry_delay: float
+    ) -> bytes:
+        """忽略迟到的 INFO 帧，直到拿到本次擦除的状态或超时。"""
+        for attempt in range(attempts):
+            if self._cancel_requested.is_set():
+                return b""
+            response = bytes(await self._transport.read_ota())
+            if response and parse_image_info_response(response) is None:
+                return response
+            if attempt + 1 < attempts:
+                await self._sleep(retry_delay)
+        return b""
 
     def _erase_read_attempts(self) -> int:
         return int(
@@ -353,6 +367,8 @@ class OtaController:
             if stage is UpgradeStage.PROGRAM
             else build_verify_command
         )
+        if stage is UpgradeStage.VERIFY:
+            await self._transport.discard_ota_responses()
         while self._progress < self._total:
             if self._stop_if_cancelled():
                 return True
@@ -397,7 +413,11 @@ class OtaController:
 
         if stage is UpgradeStage.VERIFY:
             await self._sleep(1)
+            if self._stop_if_cancelled():
+                return True
             response = await self._read_verify_response()
+            if self._stop_if_cancelled():
+                return True
             await self._require_verify_success(response)
         return False
 

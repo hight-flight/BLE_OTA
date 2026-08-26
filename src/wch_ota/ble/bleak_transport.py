@@ -159,6 +159,10 @@ class BleakTransport:
             raise TransportError(f"读取 OTA 特征失败：{exc}") from exc
         return bytes(value)
 
+    async def discard_ota_responses(self) -> None:
+        """Bleak 通过非缓存 GATT 读取获取状态，没有本地通知队列可清理。"""
+        return
+
     async def write_ota(self, payload: bytes, *, response: bool = False) -> None:
         characteristic = self._require_characteristic()
         client = self._require_client()

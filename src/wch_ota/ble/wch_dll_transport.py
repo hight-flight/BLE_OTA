@@ -319,6 +319,14 @@ class WchDllBinding:
             frames = self._notify_buffers.get(key)
             return frames.popleft() if frames else b""
 
+    def discard_notify(self, handle: Any, characteristic_uuid: int) -> None:
+        """清空指定特征尚未被协议状态机消费的通知帧。"""
+        key = (_handle_key(handle), characteristic_uuid)
+        with self._notify_lock:
+            frames = self._notify_buffers.get(key)
+            if frames is not None:
+                frames.clear()
+
     def _on_notify(self, frames: deque[bytes], buf: Any, length: int) -> None:
         if not buf or not length:
             return
@@ -1044,13 +1052,21 @@ class WchDllTransport:
                 )
                 if self._handle is not handle:
                     raise TransportError("连接初始化期间设备已断开")
-            except Exception:
+            except Exception as error:
                 await self._unregister_notifications(handle)
-                await self._call_binding(self._binding.close_device, handle)
+                close_error: Exception | None = None
+                try:
+                    await self._call_binding(self._binding.close_device, handle)
+                except Exception as cleanup_error:
+                    close_error = cleanup_error
                 self._handle = None
                 self._mtu = 23
                 self._ota_properties = ()
                 self._notify_characteristic = None
+                if close_error is not None:
+                    raise TransportError(
+                        f"{error}；关闭连接句柄失败：{close_error}"
+                    ) from error
                 raise
 
     async def _open_device_with_fallback(
@@ -1214,6 +1230,14 @@ class WchDllTransport:
             if payload:
                 return payload
         return b""
+
+    async def discard_ota_responses(self) -> None:
+        """丢弃校验前遗留的通知帧，保留 GATT 读取作为设备兼容回退。"""
+        handle = self._require_handle()
+        for uuid in {0xFEE1, self._notify_characteristic}:
+            if uuid is None:
+                continue
+            await self._call_binding(self._binding.discard_notify, handle, uuid)
 
     async def _read_characteristic(
         self, handle: Any, characteristic_uuid: int, *, count_empty: bool

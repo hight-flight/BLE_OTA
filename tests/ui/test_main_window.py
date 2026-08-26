@@ -144,7 +144,7 @@ def test_reference_layout_compacts_controls_and_gives_log_more_space(window):
     assert widget.log_panel.isAncestorOf(widget.export_button)
     assert widget.log_panel.isAncestorOf(widget.clear_log_button)
     assert not widget.statusBar().isSizeGripEnabled()
-    assert widget.version_label.text() == "V1.0.0"
+    assert widget.version_label.text() == "V1.1.0"
     assert widget.statusBar().isAncestorOf(widget.version_label)
 
 
@@ -313,7 +313,7 @@ async def test_selection_connects_using_original_ble_device(window):
 
 @pytest.mark.asyncio
 async def test_reconnect_button_is_shown_only_after_device_info_succeeds(window):
-    widget, _, controller = window
+    widget, transport, controller = window
     device = Device("OTA", "11:22")
     widget._on_device_detected(device, Advertisement(None, -55))
     widget.device_view.selectRow(0)
@@ -325,6 +325,23 @@ async def test_reconnect_button_is_shown_only_after_device_info_succeeds(window)
     await widget.connect_selected()
 
     assert widget.reconnect_button.isHidden()
+    assert transport.is_connected
+    assert widget._connected
+
+
+def test_late_scan_result_from_previous_session_is_ignored(window):
+    widget, _, _ = window
+
+    widget._set_scanning(True)
+    old_session = widget._scan_generation
+    widget._advance_scan_generation()
+    widget._set_scanning(False)
+
+    widget._forward_scan_result(
+        old_session, Device("过期设备", "11:22"), Advertisement(None, -55)
+    )
+
+    assert widget.device_model.rowCount() == 0
 
 
 @pytest.mark.asyncio
