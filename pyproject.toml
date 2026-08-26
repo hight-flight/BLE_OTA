@@ -33,4 +33,5 @@ qt_api = "pyside6"
 where = ["src"]
 
 [tool.setuptools.package-data]
+wch_ota = ["BLE.ico"]
 "wch_ota.ble" = ["WCHBLEDLL*.dll"]

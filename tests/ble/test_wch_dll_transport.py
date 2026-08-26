@@ -13,7 +13,9 @@ from wch_ota.ble.wch_dll_transport import (
     WchDevice,
     WchDllBinding,
     WchDllTransport,
+    _ADVERTISING_SNAPSHOT_SIZE,
     _default_dll_path,
+    _parse_advertising_snapshot,
 )
 
 
@@ -63,7 +65,6 @@ class FakeBinding:
         self._record_thread()
         self.enumerate_calls += 1
         return list(self.records)
-
     def open_device(self, device_id: str, callback):
         self._record_thread()
         self.connected_id = device_id
@@ -190,7 +191,7 @@ class FakeRawDll:
             code=10,
             os_error=0x80070005,
             att_error=0x03,
-            message=b"write failed",
+            message=getattr(self, "error_message", b"write failed"),
         )
 
     def WCHBLEReadCharacteristic(
@@ -219,6 +220,50 @@ class FakeRawDll:
 
 def test_default_binding_uses_official_v15_dll() -> None:
     assert _default_dll_path().name == "WCHBLEDLL_v15.dll"
+
+
+@pytest.mark.asyncio
+async def test_default_scan_window_returns_results_within_one_second() -> None:
+    class ScanDurationBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scan_durations: list[int] = []
+
+        def enumerate_devices(self, scan_ms: int):
+            self.scan_durations.append(scan_ms)
+            return super().enumerate_devices(scan_ms)
+
+    binding = ScanDurationBinding()
+    transport = WchDllTransport(binding=binding)
+
+    await transport.start_scan(lambda _device, _advertisement: None)
+    await transport.stop_scan()
+
+    assert binding.scan_durations[0] == 1000
+
+
+@pytest.mark.asyncio
+async def test_default_continuous_scan_uses_long_window_to_find_slow_devices() -> None:
+    class ScanDurationBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scan_durations: list[int] = []
+
+        def enumerate_devices(self, scan_ms: int):
+            self.scan_durations.append(scan_ms)
+            return super().enumerate_devices(scan_ms)
+
+    binding = ScanDurationBinding()
+    transport = WchDllTransport(binding=binding)
+
+    await transport.start_scan(lambda _device, _advertisement: None)
+    for _ in range(50):
+        if len(binding.scan_durations) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await transport.stop_scan()
+
+    assert binding.scan_durations[:2] == [1000, 3000]
 
 
 @pytest.mark.asyncio
@@ -306,6 +351,473 @@ def test_binding_decodes_wch_dll_scan_records() -> None:
     assert records[0].device_id == "BluetoothLE#adapter-dc:32:62:1a:fd:22"
     assert records[0].address == "DC:32:62:1A:FD:22"
     assert records[0].rssi == -48
+
+
+def test_parses_live_advertising_name_mac_and_rssi() -> None:
+    snapshot = bytearray(_ADVERTISING_SNAPSHOT_SIZE)
+    snapshot[0:6] = bytes.fromhex("DC 32 62 1A FD 22")
+    snapshot[16:20] = (4).to_bytes(4, "little")  # scan response
+    snapshot[20:24] = (1).to_bytes(4, "little")
+    snapshot[56:60] = (1).to_bytes(4, "little")
+    name = b"JGS_CHICKEN_1.4.04"
+    snapshot[60:64] = (0x09).to_bytes(4, "little")
+    snapshot[64:68] = len(name).to_bytes(4, "little")
+    snapshot[68 : 68 + len(name)] = name
+    snapshot[0x10F10:0x10F14] = (-47).to_bytes(4, "little", signed=True)
+
+    record = _parse_advertising_snapshot(snapshot)
+
+    assert record.address == "DC:32:62:1A:FD:22"
+    assert record.name == "JGS_CHICKEN_1.4.04"
+    assert record.rssi == -47
+    assert record.device_id == ""
+
+
+def test_binding_registers_and_unregisters_live_advertising_callback() -> None:
+    class AdvertisingDll(FakeRawDll):
+        def __init__(self) -> None:
+            super().__init__()
+            self.callbacks = []
+
+        def WCHBLERegisterAdvertisingNotify(self, callback) -> int:
+            self.callbacks.append(callback)
+            if callback:
+                snapshot = (ctypes.c_ubyte * _ADVERTISING_SNAPSHOT_SIZE)()
+                snapshot[0:6] = bytes.fromhex("DC 32 62 1A FD 22")
+                snapshot[0x10F10:0x10F14] = (-55).to_bytes(
+                    4, "little", signed=True
+                )
+                callback(ctypes.addressof(snapshot))
+            return 1
+
+    raw = AdvertisingDll()
+    binding = WchDllBinding(library=raw)
+    records = []
+
+    assert binding.register_advertising_notify(records.append)
+    assert records[0].address == "DC:32:62:1A:FD:22"
+    assert records[0].rssi == -55
+    assert binding.unregister_advertising_notify()
+    assert raw.callbacks[-1] is None
+
+
+def test_failed_advertising_unregistration_keeps_callback_alive_for_retry() -> None:
+    class FlakyAdvertisingDll(FakeRawDll):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_results = [0, 1]
+
+        def WCHBLERegisterAdvertisingNotify(self, callback) -> int:
+            if callback:
+                self.callback = callback
+                return 1
+            return self.stop_results.pop(0)
+
+    binding = WchDllBinding(library=FlakyAdvertisingDll())
+    assert binding.register_advertising_notify(lambda _record: None)
+
+    assert not binding.unregister_advertising_notify()
+    assert binding._advertising_callback is not None
+    assert binding.unregister_advertising_notify()
+    assert binding._advertising_callback is None
+
+
+@pytest.mark.asyncio
+async def test_transport_retries_failed_native_scan_unregistration() -> None:
+    class FlakyStopBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_results = [False, True]
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def open_device_address(self, _address, _callback):
+            return self.handle
+
+        def unregister_advertising_notify(self) -> bool:
+            return self.stop_results.pop(0)
+
+    transport = WchDllTransport(binding=FlakyStopBinding())
+    await transport.start_scan(lambda *_args: None)
+
+    with pytest.raises(TransportError, match="注销实时广播扫描失败"):
+        await transport.stop_scan()
+    assert transport._native_scan_active
+
+    await transport.stop_scan()
+    assert not transport._native_scan_active
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_in_progress_native_scan_registration() -> None:
+    class BlockingStartBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.unregistered = False
+
+        def register_advertising_notify(self, _callback) -> bool:
+            self.entered.set()
+            self.release.wait(timeout=2)
+            return True
+
+        def open_device_address(self, _address, _callback):
+            return self.handle
+
+        def unregister_advertising_notify(self) -> bool:
+            self.unregistered = True
+            return True
+
+    binding = BlockingStartBinding()
+    transport = WchDllTransport(binding=binding)
+    start_task = asyncio.create_task(transport.start_scan(lambda *_args: None))
+    assert await asyncio.to_thread(binding.entered.wait, 1)
+    stop_task = asyncio.create_task(transport.stop_scan())
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+
+    binding.release.set()
+    await start_task
+    await stop_task
+
+    assert binding.unregistered
+    assert not transport._native_scan_active
+
+
+@pytest.mark.asyncio
+async def test_transport_enriches_names_before_live_advertising_updates() -> None:
+    class LiveBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.advertising_callback = None
+            self.unregistered = False
+
+        def register_advertising_notify(self, callback) -> bool:
+            self.advertising_callback = callback
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            self.unregistered = True
+            self.advertising_callback = None
+            return True
+
+        def open_device_address(self, _address, _callback):
+            return self.handle
+
+    binding = LiveBinding()
+    transport = WchDllTransport(binding=binding)
+    discoveries = []
+    await transport.start_scan(lambda *args: discoveries.append(args))
+
+    assert binding.enumerate_calls == 1
+    assert discoveries[0][0].name == "JGS_CHICKEN_1.4.04"
+    assert discoveries[0][0].device_id == binding.records[0].device_id
+
+    binding.advertising_callback(Record("", "", "DC:32:62:1A:FD:22", -60))
+    await asyncio.sleep(0)
+    assert discoveries[-1][0].name == "JGS_CHICKEN_1.4.04"
+
+    binding.advertising_callback(
+        Record("Feeder_e8f322", "", "DC:32:62:1A:FD:22", -58)
+    )
+    await asyncio.sleep(0)
+
+    assert discoveries[-1][0].name == "Feeder_e8f322"
+    assert discoveries[-1][1].local_name == "Feeder_e8f322"
+    await transport.stop_scan()
+    assert binding.unregistered
+
+
+def test_binding_opens_live_advertising_device_by_address() -> None:
+    class AddressDll(FakeRawDll):
+        def WCHBLEOpenDeviceAddress(self, address, is_cache_mode, callback):
+            self.opened_address = bytes(address)
+            self.cache_modes.append(bool(is_cache_mode))
+            self.connection_callback = callback
+            return self.handle
+
+    raw = AddressDll()
+    binding = WchDllBinding(library=raw)
+
+    handle = binding.open_device_address(
+        "DC:32:62:1A:FD:22", lambda _handle, _state: None
+    )
+
+    assert handle == raw.handle
+    assert raw.opened_address == bytes.fromhex("DC 32 62 1A FD 22")
+    assert raw.cache_modes == [False]
+
+
+@pytest.mark.asyncio
+async def test_transport_connects_live_scan_result_by_address() -> None:
+    class AddressBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.connected_address = None
+
+        def open_device_address(self, address: str, callback):
+            self._record_thread()
+            self.connected_address = address
+            self.connection_callback = callback
+            return self.handle
+
+    binding = AddressBinding()
+    transport = WchDllTransport(binding=binding)
+
+    await transport.connect(WchDevice("Feeder_e8f322", "78:21:84:E8:F3:22", ""))
+
+    assert binding.connected_address == "78:21:84:E8:F3:22"
+    assert binding.connected_id is None
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_live_scan_is_not_used_without_address_connection_capability() -> None:
+    class NotifyOnlyBinding(FakeBinding):
+        def register_advertising_notify(self, _callback) -> bool:
+            raise AssertionError("缺少按地址连接能力时不应注册实时广播")
+
+    binding = NotifyOnlyBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+
+    await transport.start_scan(lambda *_args: None)
+    await transport.stop_scan()
+
+    assert binding.enumerate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_address_connection_failure_falls_back_to_resolved_device_id() -> None:
+    class FallbackBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.address_attempts = []
+            self.unregister_calls = 0
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            self.unregister_calls += 1
+            return True
+
+        def open_device_address(self, address: str, _callback):
+            self.address_attempts.append(address)
+            raise TransportError("按地址连接失败")
+
+    binding = FallbackBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    await transport.start_scan(lambda *_args: None)
+
+    await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", ""))
+
+    assert binding.address_attempts == ["DC:32:62:1A:FD:22"]
+    assert binding.unregister_calls == 1
+    assert binding.connected_id == binding.records[0].device_id
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_address_connection_retries_device_id_resolution_when_first_scans_miss() -> None:
+    class DelayedDiscoveryBinding(FakeBinding):
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            return True
+
+        def open_device_address(self, _address: str, _callback):
+            raise TransportError("按地址连接失败")
+
+        def enumerate_devices(self, _scan_ms: int):
+            self._record_thread()
+            self.enumerate_calls += 1
+            return [] if self.enumerate_calls < 3 else list(self.records)
+
+    binding = DelayedDiscoveryBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    await transport.start_scan(lambda *_args: None)
+
+    await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", ""))
+
+    assert binding.enumerate_calls == 3
+    assert binding.connected_id == binding.records[0].device_id
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_late_disconnect_from_failed_address_attempt_does_not_drop_fallback_connection() -> None:
+    class LateCallbackBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_address_callback = None
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            return True
+
+        def open_device_address(self, _address: str, callback):
+            self.failed_address_callback = callback
+            return None
+
+    binding = LateCallbackBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    await transport.start_scan(lambda *_args: None)
+
+    await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", ""))
+    binding.failed_address_callback(None, False)
+    await asyncio.sleep(0)
+
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_device_id_connection_failure_falls_back_to_address_during_live_scan() -> None:
+    class DeviceIdFailureBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.address_attempts = []
+            self.unregister_calls = 0
+
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            self.unregister_calls += 1
+            return True
+
+        def open_device(self, device_id: str, _callback):
+            self.connected_id = device_id
+            raise TransportError("WCHBLEOpenDevice 返回空句柄")
+
+        def open_device_address(self, address: str, callback):
+            self.address_attempts.append(address)
+            self.connection_callback = callback
+            return self.handle
+
+    binding = DeviceIdFailureBinding()
+    transport = WchDllTransport(binding=binding)
+    await transport.start_scan(lambda *_args: None)
+    stale_id = "BluetoothLE#stale-dc:32:62:1a:fd:22"
+
+    await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", stale_id))
+
+    assert binding.connected_id == stale_id
+    assert binding.address_attempts == ["DC:32:62:1A:FD:22"]
+    assert binding.unregister_calls == 1
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_device_id_connection_failure_rescans_and_retries_latest_device_id() -> None:
+    class RefreshedIdBinding(FakeBinding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.open_attempts = []
+
+        def open_device(self, device_id: str, callback):
+            self.open_attempts.append(device_id)
+            if device_id.startswith("BluetoothLE#stale-"):
+                raise TransportError("WCHBLEOpenDevice 返回空句柄")
+            self.connection_callback = callback
+            return self.handle
+
+    binding = RefreshedIdBinding()
+    transport = WchDllTransport(binding=binding, scan_duration_ms=1)
+    stale_id = "BluetoothLE#stale-dc:32:62:1a:fd:22"
+
+    await transport.connect(WchDevice("OTA", "dc-32-62-1a-fd-22", stale_id))
+
+    assert binding.enumerate_calls == 1
+    assert binding.open_attempts == [stale_id, binding.records[0].device_id]
+    assert transport.is_connected
+    await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_closes_new_handle_when_stopping_live_scan_fails() -> None:
+    class StopFailureBinding(FakeBinding):
+        def register_advertising_notify(self, _callback) -> bool:
+            return True
+
+        def unregister_advertising_notify(self) -> bool:
+            return False
+
+        def open_device_address(self, _address: str, callback):
+            self.connection_callback = callback
+            return self.handle
+
+    binding = StopFailureBinding()
+    transport = WchDllTransport(binding=binding)
+    await transport.start_scan(lambda *_args: None)
+
+    with pytest.raises(TransportError, match="注销实时广播扫描失败"):
+        await transport.connect(WchDevice("OTA", "DC:32:62:1A:FD:22", ""))
+
+    assert binding.closed == [binding.handle]
+    assert not transport.is_connected
+
+
+@pytest.mark.asyncio
+async def test_disconnect_callback_before_open_returns_rejects_connection() -> None:
+    class EarlyDisconnectBinding(FakeBinding):
+        def open_device(self, device_id: str, callback):
+            self.connected_id = device_id
+            callback(self.handle, False)
+            return self.handle
+
+    binding = EarlyDisconnectBinding()
+    transport = WchDllTransport(binding=binding)
+    device = WchDevice("OTA", "DC:32:62:1A:FD:22", binding.records[0].device_id)
+
+    with pytest.raises(TransportError, match="连接建立期间设备已断开"):
+        await transport.connect(device)
+
+    assert not transport.is_connected
+    assert binding.closed == [binding.handle]
+
+
+def test_binding_accepts_device_id_suffix_after_device_mac() -> None:
+    class SuffixedDeviceIdDll(FakeRawDll):
+        def WCHBLEEnumDevice(self, _duration, _filter, records, count) -> None:
+            name = b"SENSOR"
+            device_id = (
+                b"BluetoothLE#BluetoothLEb8:1e:a4:e6:64:96-"
+                b"dc:32:62:1a:fd:22_suffix"
+            )
+            records[0].Name[: len(name)] = name
+            records[0].DevID[: len(device_id)] = device_id
+            records[0].Rssi = -60
+            count._obj.value = 1
+
+    records = WchDllBinding(library=SuffixedDeviceIdDll()).enumerate_devices(10)
+
+    assert len(records) == 1
+    assert records[0].address == "DC:32:62:1A:FD:22"
+
+
+def test_binding_provides_capacity_for_crowded_scan_results() -> None:
+    class CapacityDll(FakeRawDll):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capacity = 0
+
+        def WCHBLEEnumDevice(self, _duration, _filter, _records, count) -> None:
+            self.capacity = count._obj.value
+            count._obj.value = 0
+
+    raw = CapacityDll()
+
+    WchDllBinding(library=raw).enumerate_devices(10)
+
+    assert raw.capacity == 256
 
 
 def test_binding_wraps_fee1_connection_and_io() -> None:
@@ -456,6 +968,16 @@ def test_binding_lists_characteristics_and_registers_notify() -> None:
     assert binding.read_characteristic(raw.handle, 0xFEE1) == b"\x02\x00"
 
 
+def test_binding_decodes_utf8_dll_error_message() -> None:
+    raw = FakeRawDll()
+    raw.write_status = 12
+    raw.error_message = "操作已被用户取消。".encode("utf-8")
+    binding = WchDllBinding(library=raw)
+
+    with pytest.raises(TransportError, match="操作已被用户取消"):
+        binding.write_ota(raw.handle, b"\x82", False)
+
+
 def test_binding_preserves_notification_frame_boundaries() -> None:
     raw = FakeRawDll()
     binding = WchDllBinding(library=raw)
@@ -555,3 +1077,32 @@ async def test_transport_keeps_gatt_read_fallback_when_both_subscriptions_fail()
     assert binding.notify_subscriptions == [0xFEE1]
     assert binding.indicate_subscriptions == [0xFEE1]
     assert await transport.read_ota() == b"\x00\x00"
+
+
+def test_transport_uses_conservative_program_and_verify_pacing_without_sync_reads() -> None:
+    transport = WchDllTransport(binding=FakeBinding())
+
+    assert transport.program_packet_delay == 0.012
+    assert transport.verify_packet_delay == 0.012
+    assert not hasattr(transport, "verify_write_with_response")
+    assert not hasattr(transport, "verify_status_per_packet")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_releases_executor_and_rejects_future_operations():
+    class RecordingExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.calls.append((wait, cancel_futures))
+
+    transport = WchDllTransport(binding=FakeBinding())
+    executor = RecordingExecutor()
+    transport._executor = executor
+
+    await transport.shutdown()
+
+    assert executor.calls == [(False, True)]
+    with pytest.raises(TransportError, match="已经关闭"):
+        await transport.start_scan(lambda _device, _advertisement: None)

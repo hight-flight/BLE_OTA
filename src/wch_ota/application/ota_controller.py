@@ -359,18 +359,67 @@ class OtaController:
                 self._transport.effective_mtu,
                 info.chip,
             )
-            await self._transport.write_ota(command)
+            verify_write_with_response = (
+                stage is UpgradeStage.VERIFY
+                and self._transport.supports_write_with_response
+                and bool(
+                    getattr(
+                        self._transport,
+                        "verify_write_with_response",
+                        False,
+                    )
+                )
+            )
+            await self._transport.write_ota(
+                command, response=verify_write_with_response
+            )
+            stage_delay_name = (
+                "program_packet_delay"
+                if stage is UpgradeStage.PROGRAM
+                else "verify_packet_delay"
+            )
+            packet_delay = float(
+                getattr(
+                    self._transport,
+                    stage_delay_name,
+                    getattr(self._transport, "ota_packet_delay", 0.0),
+                )
+            )
+            if packet_delay > 0 and not verify_write_with_response:
+                await self._sleep(packet_delay)
             actual_payload = min(command[1], self._total - self._progress)
             self._progress += actual_payload
             self._emit(UpgradeStatus.RUNNING)
 
         if stage is UpgradeStage.VERIFY:
             await self._sleep(1)
-            response = await self._read_nonempty_response()
-            if not is_verify_success(response):
-                probe_message, _, _ = await self._probe_info_channel()
-                raise OtaError(f"校验失败：设备返回错误状态；{probe_message}")
+            response = await self._read_verify_response()
+            await self._require_verify_success(response)
         return False
+
+    async def _require_verify_success(self, response: bytes) -> None:
+        if is_verify_success(response):
+            return
+        probe_message, _, _ = await self._probe_info_channel()
+        rx = response.hex(" ").upper() or "空"
+        raise OtaError(
+            f"校验失败：设备返回错误状态；校验RX={rx}；{probe_message}"
+        )
+
+    async def _read_verify_response(self) -> bytes:
+        """忽略 FEE1 中残留的 INFO 值，等待真正的校验状态。"""
+        last_nonempty = b""
+        for attempt in range(_READ_NULL_ATTEMPTS):
+            if self._cancel_requested.is_set():
+                return b""
+            response = bytes(await self._transport.read_ota())
+            if response:
+                last_nonempty = response
+                if parse_image_info_response(response) is None:
+                    return response
+            if attempt + 1 < _READ_NULL_ATTEMPTS:
+                await self._sleep(_READ_NULL_RETRY_DELAY)
+        return last_nonempty
 
     async def _read_nonempty_response(
         self,

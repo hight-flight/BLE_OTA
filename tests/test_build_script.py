@@ -33,10 +33,10 @@ def _load_python_build_script():
 
 def test_python_build_script_runs_tests_then_pyinstaller(tmp_path) -> None:
     module = _load_python_build_script()
-    module.SPEC_FILE = tmp_path / "wch-ota.spec"
+    module.ONEFILE_SPEC_FILE = tmp_path / "wch-ota-onefile.spec"
     module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
-    module.OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
-    module.SPEC_FILE.write_text("# test spec", encoding="utf-8")
+    module.ONEFILE_OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
+    module.ONEFILE_SPEC_FILE.write_text("# test spec", encoding="utf-8")
     module.WCH_DLL.write_bytes(b"dll")
 
     commands: list[list[str]] = []
@@ -44,8 +44,8 @@ def test_python_build_script_runs_tests_then_pyinstaller(tmp_path) -> None:
     def fake_runner(command: list[str]) -> None:
         commands.append(command)
         if "PyInstaller" in command:
-            module.OUTPUT_EXE.parent.mkdir(parents=True)
-            module.OUTPUT_EXE.write_bytes(b"exe")
+            module.ONEFILE_OUTPUT_EXE.parent.mkdir(parents=True)
+            module.ONEFILE_OUTPUT_EXE.write_bytes(b"exe")
 
     result = module.build(runner=fake_runner)
 
@@ -68,27 +68,57 @@ def test_python_build_script_runs_tests_then_pyinstaller(tmp_path) -> None:
         "PyInstaller",
         "--noconfirm",
         "--clean",
-        str(module.SPEC_FILE),
+        str(module.ONEFILE_SPEC_FILE),
     ]
-    assert result == module.OUTPUT_EXE
+    assert result == module.ONEFILE_OUTPUT_EXE
 
 
 def test_python_build_script_can_skip_tests(tmp_path) -> None:
     module = _load_python_build_script()
-    module.SPEC_FILE = tmp_path / "wch-ota.spec"
+    module.ONEFILE_SPEC_FILE = tmp_path / "wch-ota-onefile.spec"
     module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
-    module.OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
-    module.SPEC_FILE.write_text("# test spec", encoding="utf-8")
+    module.ONEFILE_OUTPUT_EXE = tmp_path / "dist" / "WCH-BLE-OTA.exe"
+    module.ONEFILE_SPEC_FILE.write_text("# test spec", encoding="utf-8")
     module.WCH_DLL.write_bytes(b"dll")
 
     commands: list[list[str]] = []
 
     def fake_runner(command: list[str]) -> None:
         commands.append(command)
-        module.OUTPUT_EXE.parent.mkdir(parents=True, exist_ok=True)
-        module.OUTPUT_EXE.write_bytes(b"exe")
+        module.ONEFILE_OUTPUT_EXE.parent.mkdir(parents=True, exist_ok=True)
+        module.ONEFILE_OUTPUT_EXE.write_bytes(b"exe")
 
     module.build(skip_tests=True, runner=fake_runner)
 
     assert len(commands) == 1
     assert commands[0][1:3] == ["-m", "PyInstaller"]
+
+
+def test_python_build_script_can_build_directory_distribution(tmp_path) -> None:
+    module = _load_python_build_script()
+    module.DIRECTORY_SPEC_FILE = tmp_path / "wch-ota.spec"
+    module.WCH_DLL = tmp_path / "WCHBLEDLL_v15.dll"
+    module.DIRECTORY_OUTPUT_EXE = (
+        tmp_path / "dist" / "WCH-BLE-OTA" / "WCH-BLE-OTA.exe"
+    )
+    module.DIRECTORY_SPEC_FILE.write_text("# test spec", encoding="utf-8")
+    module.WCH_DLL.write_bytes(b"dll")
+    commands: list[list[str]] = []
+
+    def fake_runner(command: list[str]) -> None:
+        commands.append(command)
+        module.DIRECTORY_OUTPUT_EXE.parent.mkdir(parents=True, exist_ok=True)
+        module.DIRECTORY_OUTPUT_EXE.write_bytes(b"exe")
+
+    result = module.build(skip_tests=True, onefile=False, runner=fake_runner)
+
+    assert commands[0][-1] == str(module.DIRECTORY_SPEC_FILE)
+    assert result == module.DIRECTORY_OUTPUT_EXE
+
+
+def test_python_build_script_defaults_to_onefile_cli_mode() -> None:
+    module = _load_python_build_script()
+
+    assert module._parse_args([]).onefile is True
+    assert module._parse_args(["--onefile"]).onefile is True
+    assert module._parse_args(["--directory"]).onefile is False

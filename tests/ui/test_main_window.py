@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHeaderView
 
 from wch_ota.application.ota_events import OtaEvent, UpgradeStage, UpgradeStatus
+from wch_ota.ble.transport import TransportError
 from wch_ota.domain.firmware import FirmwareImage
 from wch_ota.domain.models import ChipType, CurrentImageInfo, ImageType
 from wch_ota.ui.main_window import MainWindow
@@ -395,6 +396,41 @@ async def test_disconnect_error_still_updates_ui_when_transport_is_already_close
 
 
 @pytest.mark.asyncio
+async def test_failed_connect_keeps_connected_ui_when_cleanup_cannot_close_transport(qtbot):
+    class HalfConnectedTransport(FakeTransport):
+        async def connect(self, device):
+            self.connect_calls += 1
+            self.connected_device = device
+            self.is_connected = True
+            raise TransportError("服务发现失败")
+
+        async def disconnect(self):
+            self.disconnected += 1
+            raise TransportError("关闭句柄失败")
+
+    transport = HalfConnectedTransport()
+    controller = FakeController()
+    widget = MainWindow(transport=transport, controller=controller)
+    qtbot.addWidget(widget)
+    device = Device("OTA", "11:22")
+    widget._on_device_detected(device, Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+    widget._set_scanning(True)
+
+    await widget.connect_selected()
+
+    assert transport.disconnected == 1
+    assert transport.is_connected
+    assert widget._connected
+    assert widget._connected_address == "11:22"
+    assert not widget._scanning
+    assert widget.disconnect_button.isEnabled()
+    log = widget.log_view.toPlainText()
+    assert "连接失败：服务发现失败" in log
+    assert "连接失败后的断开清理失败：关闭句柄失败" in log
+
+
+@pytest.mark.asyncio
 async def test_connect_stops_scanner_before_opening_device(qtbot):
     order = []
 
@@ -416,6 +452,33 @@ async def test_connect_stops_scanner_before_opening_device(qtbot):
     await widget.connect_selected()
 
     assert order[:2] == ["stop_scan", "connect"]
+
+
+@pytest.mark.asyncio
+async def test_wch_live_scan_stops_after_connection_handle_is_opened(qtbot):
+    order = []
+
+    class LiveScanTransport(FakeTransport):
+        stop_scan_before_connect = False
+
+        async def connect(self, device):
+            order.append("connect")
+            await super().connect(device)
+
+        async def stop_scan(self):
+            order.append("stop_scan")
+            await super().stop_scan()
+
+    transport = LiveScanTransport()
+    widget = MainWindow(transport=transport, controller=FakeController())
+    qtbot.addWidget(widget)
+    widget._on_device_detected(Device("OTA", "11:22"), Advertisement(None, -55))
+    widget.device_view.selectRow(0)
+    widget._set_scanning(True)
+
+    await widget.connect_selected()
+
+    assert order[:2] == ["connect", "stop_scan"]
 
 
 def test_empty_exception_log_includes_exception_type(window):
@@ -671,6 +734,27 @@ async def test_shutdown_stops_scan_and_disconnects(window):
 
     assert transport.stopped == 1
     assert transport.disconnected == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prefers_transport_owned_cleanup(qtbot):
+    class ManagedTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    transport = ManagedTransport()
+    widget = MainWindow(transport=transport, controller=FakeController())
+    qtbot.addWidget(widget)
+
+    await widget.shutdown()
+
+    assert transport.shutdown_calls == 1
+    assert transport.stopped == 0
+    assert transport.disconnected == 0
 
 
 def test_start_requires_parseable_existing_firmware(window, tmp_path):

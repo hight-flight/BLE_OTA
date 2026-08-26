@@ -399,6 +399,168 @@ async def test_verify_does_not_treat_info_probe_as_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_ignores_stale_info_value_and_waits_for_status() -> None:
+    events = []
+    stale_info = info_response(block_size=16)
+    transport = FakeTransport(
+        responses=[stale_info, b"\x00", stale_info, b"\x00"],
+        mtu=23,
+    )
+
+    await OtaController(transport, events.append, sleep=no_sleep).upgrade(
+        FirmwareImage(0, bytes(16)), image_info(block_size=16)
+    )
+
+    assert events[-1].status is UpgradeStatus.SUCCESS
+    assert transport.writes[-1] == build_end_command()
+
+
+@pytest.mark.asyncio
+async def test_verify_failure_reports_actual_response_bytes() -> None:
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\xFF\x00"]
+        + [info_response(block_size=16)],
+        mtu=23,
+    )
+
+    with pytest.raises(OtaError, match=r"校验RX=FF 00"):
+        await OtaController(transport, sleep=no_sleep).upgrade(
+            FirmwareImage(0, bytes(16)), image_info(block_size=16)
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_honors_transport_packet_delay() -> None:
+    delays = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+        supports_write_with_response=True,
+    )
+    transport.ota_packet_delay = 0.006
+
+    await OtaController(transport, sleep=record_sleep).upgrade(
+        FirmwareImage(0, bytes(16)), image_info(block_size=16)
+    )
+
+    assert delays.count(0.006) == 2
+
+
+@pytest.mark.asyncio
+async def test_verify_uses_write_response_without_reading_each_packet() -> None:
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+        supports_write_with_response=True,
+    )
+    transport.verify_write_with_response = True
+    firmware = FirmwareImage(0, bytes(range(20)))
+
+    await OtaController(transport, sleep=no_sleep).upgrade(firmware, image_info())
+
+    assert transport.read_calls == 3
+    verify_modes = [
+        response
+        for packet, response in zip(transport.writes, transport.write_responses)
+        if packet[0] == 0x82
+    ]
+    assert verify_modes == [True, True]
+    assert transport.writes[-1] == build_end_command()
+
+
+@pytest.mark.asyncio
+async def test_verify_write_response_still_checks_final_device_status() -> None:
+    transport = FakeTransport(
+        responses=[
+            info_response(block_size=16),
+            b"\x00",
+            b"\xFF\x00",
+            info_response(block_size=16),
+        ],
+        mtu=23,
+        supports_write_with_response=True,
+    )
+    transport.verify_write_with_response = True
+    firmware = FirmwareImage(0, bytes(range(20)))
+
+    with pytest.raises(OtaError, match=r"校验RX=FF 00"):
+        await OtaController(transport, sleep=no_sleep).upgrade(firmware, image_info())
+
+    assert [packet[0] for packet in transport.writes].count(0x82) == 2
+    assert all(packet[0] != 0x83 for packet in transport.writes)
+
+
+@pytest.mark.asyncio
+async def test_verify_does_not_request_write_response_when_characteristic_lacks_it() -> None:
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+    )
+    transport.verify_write_with_response = True
+
+    await OtaController(transport, sleep=no_sleep).upgrade(
+        FirmwareImage(0, bytes(16)), image_info()
+    )
+
+    verify_modes = [
+        response
+        for packet, response in zip(transport.writes, transport.write_responses)
+        if packet[0] == 0x82
+    ]
+    assert verify_modes == [False]
+
+
+@pytest.mark.asyncio
+async def test_verify_write_response_skips_redundant_packet_delay() -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+        supports_write_with_response=True,
+    )
+    transport.ota_packet_delay = 0.006
+    transport.verify_write_with_response = True
+
+    await OtaController(transport, sleep=record_sleep).upgrade(
+        FirmwareImage(0, bytes(range(20))), image_info()
+    )
+
+    # 两个编程包继续节流；两个有响应校验包不再重复等待。
+    assert delays.count(0.006) == 2
+
+
+@pytest.mark.asyncio
+async def test_transfer_uses_stage_specific_packet_delays() -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    transport = FakeTransport(
+        responses=[info_response(block_size=16), b"\x00", b"\x00"],
+        mtu=23,
+    )
+    transport.ota_packet_delay = 0.006
+    transport.program_packet_delay = 0.006
+    transport.verify_packet_delay = 0.012
+
+    await OtaController(transport, sleep=record_sleep).upgrade(
+        FirmwareImage(0, bytes(range(20))), image_info()
+    )
+
+    assert delays.count(0.006) == 2
+    assert delays.count(0.012) == 2
+
+
+@pytest.mark.asyncio
 async def test_upgrade_rejects_firmware_larger_than_target_image() -> None:
     transport = FakeTransport()
     events = []

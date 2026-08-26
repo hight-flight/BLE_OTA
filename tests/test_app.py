@@ -9,6 +9,7 @@ def test_create_application_returns_hidden_main_window(qapp):
     assert window.size().width() == 1200
     assert window.size().height() == 800
     assert window.isHidden()
+    assert not window.windowIcon().isNull()
 
 
 def test_wch_dll_transport_is_default_and_disconnect_callback_is_wired(qapp, monkeypatch):

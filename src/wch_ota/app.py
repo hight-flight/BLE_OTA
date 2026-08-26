@@ -1,10 +1,16 @@
 import os
+from pathlib import Path
 from typing import Any
+
+from PySide6.QtGui import QIcon
 
 from .application.ota_controller import OtaController
 from .ble.bleak_transport import BleakTransport
 from .ble.wch_dll_transport import WchDllTransport
 from .ui.main_window import MainWindow
+
+
+WINDOW_ICON = Path(__file__).with_name("BLE.ico")
 
 
 def create_application(
@@ -34,5 +40,6 @@ def create_application(
         )
     active_controller = controller or OtaController(active_transport)
     window = MainWindow(transport=active_transport, controller=active_controller)
+    window.setWindowIcon(QIcon(str(WINDOW_ICON)))
     window_reference["window"] = window
     return window

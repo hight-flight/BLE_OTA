@@ -11,9 +11,13 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-SPEC_FILE = PROJECT_ROOT / "packaging" / "wch-ota.spec"
+ONEFILE_SPEC_FILE = PROJECT_ROOT / "packaging" / "wch-ota-onefile.spec"
+DIRECTORY_SPEC_FILE = PROJECT_ROOT / "packaging" / "wch-ota.spec"
 WCH_DLL = PROJECT_ROOT / "src" / "wch_ota" / "ble" / "WCHBLEDLL_v15.dll"
-OUTPUT_EXE = PROJECT_ROOT / "dist" / "WCH-BLE-OTA" / "WCH-BLE-OTA.exe"
+ONEFILE_OUTPUT_EXE = PROJECT_ROOT / "dist" / "WCH-BLE-OTA.exe"
+DIRECTORY_OUTPUT_EXE = (
+    PROJECT_ROOT / "dist" / "WCH-BLE-OTA" / "WCH-BLE-OTA.exe"
+)
 
 CommandRunner = Callable[[list[str]], None]
 
@@ -23,11 +27,11 @@ def run_command(command: list[str]) -> None:
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
 
-def _validate_inputs() -> None:
+def _validate_inputs(spec_file: Path) -> None:
     if sys.version_info < (3, 11):
         raise RuntimeError("需要 Python 3.11 或更高版本")
-    if not SPEC_FILE.is_file():
-        raise FileNotFoundError(f"未找到 PyInstaller 配置：{SPEC_FILE}")
+    if not spec_file.is_file():
+        raise FileNotFoundError(f"未找到 PyInstaller 配置：{spec_file}")
     if not WCH_DLL.is_file():
         raise FileNotFoundError(f"未找到 WCH 蓝牙 DLL：{WCH_DLL}")
 
@@ -35,10 +39,13 @@ def _validate_inputs() -> None:
 def build(
     *,
     skip_tests: bool = False,
+    onefile: bool = True,
     runner: CommandRunner = run_command,
 ) -> Path:
-    """运行测试并通过 PyInstaller 构建目录分发包。"""
-    _validate_inputs()
+    """运行测试并通过 PyInstaller 构建单文件或目录分发包。"""
+    spec_file = ONEFILE_SPEC_FILE if onefile else DIRECTORY_SPEC_FILE
+    output_exe = ONEFILE_OUTPUT_EXE if onefile else DIRECTORY_OUTPUT_EXE
+    _validate_inputs(spec_file)
 
     if not skip_tests:
         print("[1/2] 运行测试……", flush=True)
@@ -68,13 +75,13 @@ def build(
             "PyInstaller",
             "--noconfirm",
             "--clean",
-            str(SPEC_FILE),
+            str(spec_file),
         ]
     )
 
-    if not OUTPUT_EXE.is_file():
-        raise FileNotFoundError(f"构建结束但未找到输出程序：{OUTPUT_EXE}")
-    return OUTPUT_EXE
+    if not output_exe.is_file():
+        raise FileNotFoundError(f"构建结束但未找到输出程序：{output_exe}")
+    return output_exe
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -84,19 +91,36 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="跳过 pytest（仅在已经完成测试时使用）",
     )
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "--onefile",
+        dest="onefile",
+        action="store_true",
+        default=True,
+        help="生成单独 EXE 文件（默认）",
+    )
+    format_group.add_argument(
+        "--directory",
+        dest="onefile",
+        action="store_false",
+        help="生成包含依赖文件的目录分发包",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        output = build(skip_tests=args.skip_tests)
+        output = build(skip_tests=args.skip_tests, onefile=args.onefile)
     except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"[错误] 打包失败：{exc}", file=sys.stderr)
         return 1
 
     print(f"[完成] 程序位置：{output}")
-    print(f"[提示] 分发时请复制整个目录：{output.parent}")
+    if args.onefile:
+        print("[提示] 当前为单文件模式，可直接分发该 EXE")
+    else:
+        print(f"[提示] 当前为目录模式，请复制整个目录：{output.parent}")
     return 0
 
 

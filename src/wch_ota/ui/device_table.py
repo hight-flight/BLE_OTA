@@ -1,8 +1,18 @@
 """BLE 扫描结果表格模型。"""
 
+import re
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+
+
+def normalize_device_address(address: Any) -> str:
+    """统一 Windows/WCH 可能返回的 MAC 大小写及分隔符。"""
+    value = str(address or "").strip().upper()
+    compact = re.sub(r"[:-]", "", value)
+    if re.fullmatch(r"[0-9A-F]{12}", compact):
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+    return value
 
 
 class DeviceTableModel(QAbstractTableModel):
@@ -13,6 +23,7 @@ class DeviceTableModel(QAbstractTableModel):
         self._rows: list[tuple[Any, Any]] = []
         self._addresses: dict[str, int] = {}
         self._names: dict[str, str] = {}
+        self._pending_names: dict[str, tuple[str, int]] = {}
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
@@ -30,16 +41,16 @@ class DeviceTableModel(QAbstractTableModel):
             return None
         device, advertisement = self._rows[index.row()]
         if index.column() == 0:
-            address = str(getattr(device, "address", ""))
+            address = normalize_device_address(getattr(device, "address", ""))
             return self._names.get(address, "未知设备")
         if index.column() == 1:
-            return getattr(device, "address", "")
+            return normalize_device_address(getattr(device, "address", ""))
         if index.column() == 2:
             return getattr(advertisement, "rssi", getattr(device, "rssi", None))
         return None
 
     def update_device(self, device: Any, advertisement: Any) -> None:
-        address = str(getattr(device, "address", ""))
+        address = normalize_device_address(getattr(device, "address", ""))
         candidates = [
             name.strip()
             for name in (
@@ -55,8 +66,27 @@ class DeviceTableModel(QAbstractTableModel):
             # 同一扫描周期可能先后收到 Shortened/Complete Local Name，保留信息更完整者。
             if len(current_name) >= len(previous_name):
                 self._names[address] = current_name
+                self._pending_names.pop(address, None)
+            elif current_name != previous_name:
+                # 真实改名也可能比旧名称短。连续收到相同短名称后再接受，避免
+                # 单个 Shortened Local Name 包覆盖完整名称。
+                pending_name, count = self._pending_names.get(address, ("", 0))
+                count = count + 1 if pending_name == current_name else 1
+                if count >= 3:
+                    self._names[address] = current_name
+                    self._pending_names.pop(address, None)
+                else:
+                    self._pending_names[address] = (current_name, count)
         if address in self._addresses:
             row = self._addresses[address]
+            previous_device, _ = self._rows[row]
+            # WCH 实时广播只有 MAC，没有 Windows Device ID。保留兼容扫描
+            # 已解析出的 Device ID，避免后续连接退化为不稳定的纯地址连接。
+            if (
+                not getattr(device, "device_id", "")
+                and getattr(previous_device, "device_id", "")
+            ):
+                device = previous_device
             self._rows[row] = (device, advertisement)
             self.dataChanged.emit(self.index(row, 0), self.index(row, 3))
             return
@@ -118,4 +148,5 @@ class DeviceTableModel(QAbstractTableModel):
             self._rows.clear()
             self._addresses.clear()
             self._names.clear()
+            self._pending_names.clear()
             self.endResetModel()

@@ -19,7 +19,7 @@ from wch_ota.application.ota_events import OtaEvent, UpgradeStatus
 from wch_ota.domain.firmware import parse_firmware
 from wch_ota.domain.models import ChipType, ImageType
 
-from .device_table import DeviceTableModel
+from .device_table import DeviceTableModel, normalize_device_address
 from .firmware_dialog import FirmwarePanel
 from .log_export import export_log
 from .theme import BLUE_WHITE_STYLESHEET
@@ -313,9 +313,15 @@ class MainWindow(QMainWindow):
 
     @Slot(object, object)
     def _on_device_detected(self, device: Any, advertisement: Any) -> None:
+        source_rows = self.device_model.rowCount()
+        visible_rows = self.device_proxy.rowCount()
         self.device_model.update_device(device, advertisement)
-        self._sync_device_action_widgets()
-        self._refresh_controls()
+        if (
+            self.device_model.rowCount() != source_rows
+            or self.device_proxy.rowCount() != visible_rows
+        ):
+            self._sync_device_action_widgets()
+            self._refresh_controls()
 
     @Slot(str)
     def _apply_device_filter(self, text: str) -> None:
@@ -407,14 +413,23 @@ class MainWindow(QMainWindow):
             self._connection_busy = True
             self._refresh_controls()
             resume_scan_on_failure = self._scanning
+            stop_before_connect = bool(
+                getattr(self.transport, "stop_scan_before_connect", True)
+            )
             try:
-                await self.transport.stop_scan()
-                self._set_scanning(False)
+                if stop_before_connect:
+                    await self.transport.stop_scan()
+                    self._set_scanning(False)
                 action = "正在重新连接" if reconnecting else "正在连接"
                 self._append_log(f"{action}：{getattr(device, 'address', '')}")
                 await self.transport.connect(device)
+                if not stop_before_connect and resume_scan_on_failure:
+                    await self.transport.stop_scan()
+                    self._set_scanning(False)
                 self._active_device = device
-                self._connected_address = str(getattr(device, "address", ""))
+                self._connected_address = normalize_device_address(
+                    getattr(device, "address", "")
+                )
                 self._ensure_connected_device_visible(device)
                 self._set_connected(True)
                 result = "重新连接成功" if reconnecting else "已连接"
@@ -436,9 +451,24 @@ class MainWindow(QMainWindow):
                 )
                 await self.get_device_info()
             except Exception as error:
-                self._set_connected(False)
+                cleanup_error: Exception | None = None
+                if self.transport.is_connected:
+                    try:
+                        await self.transport.disconnect()
+                    except Exception as disconnect_error:
+                        cleanup_error = disconnect_error
+                still_connected = bool(self.transport.is_connected)
+                if still_connected:
+                    self._active_device = device
+                    self._connected_address = normalize_device_address(
+                        getattr(device, "address", "")
+                    )
+                    self._ensure_connected_device_visible(device)
+                self._set_connected(still_connected)
                 self._report_error("连接失败", error)
-                if resume_scan_on_failure:
+                if cleanup_error is not None:
+                    self._report_error("连接失败后的断开清理失败", cleanup_error)
+                if resume_scan_on_failure and not still_connected:
                     await self.start_scan()
             finally:
                 self._connection_busy = False
@@ -446,7 +476,7 @@ class MainWindow(QMainWindow):
 
     def _ensure_connected_device_visible(self, device: Any) -> None:
         """重连不依赖扫描列表，但连接后必须恢复可操作的设备行。"""
-        address = str(getattr(device, "address", ""))
+        address = normalize_device_address(getattr(device, "address", ""))
         source_row = next(
             (
                 row
@@ -779,6 +809,17 @@ class MainWindow(QMainWindow):
     async def _cleanup_transport(self) -> None:
         """即使等待升级被取消，也必须尽力释放扫描器与连接句柄。"""
         if self._transport_cleanup_complete:
+            return
+        shutdown = getattr(self.transport, "shutdown", None)
+        if callable(shutdown):
+            try:
+                async with asyncio.timeout(2.5):
+                    await shutdown()
+            except TimeoutError:
+                self._append_log("关闭清理超时：释放蓝牙后端")
+            except Exception as error:
+                self._append_log(f"关闭清理失败：{error}")
+            self._transport_cleanup_complete = True
             return
         operations = (
             ("停止扫描", self.transport.stop_scan),

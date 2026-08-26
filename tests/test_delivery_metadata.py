@@ -21,6 +21,9 @@ def test_readme_and_project_metadata_use_pyside6_bleak_stack() -> None:
     assert metadata["tool"]["setuptools"]["package-data"]["wch_ota.ble"] == [
         "WCHBLEDLL*.dll"
     ]
+    assert metadata["tool"]["setuptools"]["package-data"]["wch_ota"] == [
+        "BLE.ico"
+    ]
 
 
 def test_pyinstaller_spec_builds_windowed_directory_distribution() -> None:
@@ -30,6 +33,9 @@ def test_pyinstaller_spec_builds_windowed_directory_distribution() -> None:
 
     assert "src/wch_ota/__main__.py" in spec.replace("\\\\", "/")
     assert "WCHBLEDLL_v15.dll" in spec
+    assert "BLE.ico" in spec
+    assert "'wch_ota'" in spec
+    assert "icon=str(project_root / 'src/wch_ota/BLE.ico')" in spec
     assert "'wch_ota/ble'" in spec
     assert "name='WCH-BLE-OTA'" in spec
     assert "console=False" in spec
@@ -38,6 +44,29 @@ def test_pyinstaller_spec_builds_windowed_directory_distribution() -> None:
     assert "'bleak.backends.winrt.scanner'" in spec
     assert "excludes=['PyQt5', 'PyQt6', 'PySide2']" in spec
     assert "COLLECT(" in spec
+
+
+def test_pyinstaller_onefile_spec_builds_a_single_windowed_executable() -> None:
+    spec = (PROJECT_ROOT / "packaging" / "wch-ota-onefile.spec").read_text(
+        encoding="utf-8"
+    )
+
+    normalized = spec.replace("\\", "/")
+    assert "src/wch_ota/__main__.py" in normalized
+    assert "WCHBLEDLL_v15.dll" in spec
+    assert "BLE.ico" in spec
+    assert "icon=str(project_root / 'src/wch_ota/BLE.ico')" in spec
+    assert "exclude_binaries=False" in spec
+    assert "console=False" in spec
+    assert "COLLECT(" not in spec
+
+
+def test_windows_ble_icon_is_a_valid_ico_file() -> None:
+    icon = PROJECT_ROOT / "src" / "wch_ota" / "BLE.ico"
+    content = icon.read_bytes()
+
+    assert content[:4] == b"\x00\x00\x01\x00"
+    assert int.from_bytes(content[4:6], "little") >= 4
 
 
 def test_pyinstaller_entrypoint_uses_package_absolute_imports() -> None:

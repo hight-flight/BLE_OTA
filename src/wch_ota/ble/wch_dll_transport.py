@@ -15,9 +15,16 @@ from typing import Any, Callable
 from .transport import DisconnectCallback, ScanCallback, TransportError
 
 _MAX_PATH = 260
-_MAC_AT_END = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})$")
+_MAX_SCAN_DEVICES = 256
+_MAC_ADDRESS = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
+_ADVERTISING_SNAPSHOT_SIZE = 0x10F18
+_ADVERTISING_SECTION_COUNT_OFFSET = 56
+_ADVERTISING_SECTION_OFFSET = 60
+_ADVERTISING_SECTION_STRIDE = 0x10C
+_ADVERTISING_RSSI_OFFSET = 0x10F10
 _ConnectionCallback = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_ubyte)
 _READ_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)
+_AdvertisingCallback = ctypes.WINFUNCTYPE(None, ctypes.c_void_p)
 TraceCallback = Callable[[str], None]
 
 
@@ -55,6 +62,7 @@ class WchDllBinding:
         self._notify_callbacks: dict[int, Any] = {}
         self._notify_modes: dict[int, str] = {}
         self._notify_lock = threading.Lock()
+        self._advertising_callback: Any | None = None
         if library is not None:
             self._dll = library
         else:
@@ -74,9 +82,19 @@ class WchDllBinding:
         if not self._dll.WCHBLEIsLowEnergySupported():
             raise TransportError("当前蓝牙适配器不支持 BLE")
 
+    @property
+    def supports_live_scan(self) -> bool:
+        return all(
+            callable(getattr(self._dll, name, None))
+            for name in (
+                "WCHBLERegisterAdvertisingNotify",
+                "WCHBLEOpenDeviceAddress",
+            )
+        )
+
     def enumerate_devices(self, scan_ms: int) -> list[WchScanRecord]:
-        records = (_BLENameDevID * 64)()
-        count = ctypes.c_ulong(64)
+        records = (_BLENameDevID * _MAX_SCAN_DEVICES)()
+        count = ctypes.c_ulong(_MAX_SCAN_DEVICES)
         self._dll.WCHBLEEnumDevice(
             ctypes.c_ulong(scan_ms), b"", records, ctypes.byref(count)
         )
@@ -84,29 +102,93 @@ class WchDllBinding:
         for raw in records[: count.value]:
             name = _decode_native_string(raw.Name)
             device_id = _decode_native_string(raw.DevID)
-            match = _MAC_AT_END.search(device_id)
-            if match is None:
+            addresses = _MAC_ADDRESS.findall(device_id)
+            if not addresses:
                 continue
             result.append(
                 WchScanRecord(
                     name=name,
                     device_id=device_id,
-                    address=match.group(1).upper(),
+                    # Windows Device ID 可能同时包含适配器 MAC、设备 MAC 和后缀；
+                    # 设备地址是其中最后一个 MAC，不要求它位于字符串末尾。
+                    address=addresses[-1].upper(),
                     rssi=int(raw.Rssi),
                 )
             )
         return result
 
+    def register_advertising_notify(
+        self, callback: Callable[[WchScanRecord], None]
+    ) -> bool:
+        """持续接收 Windows 广播，与 WCH BLE 调试工具的扫描方式一致。"""
+        register = getattr(self._dll, "WCHBLERegisterAdvertisingNotify", None)
+        if not callable(register):
+            return False
+
+        @_AdvertisingCallback
+        def native_callback(snapshot_pointer: Any) -> None:
+            if not snapshot_pointer:
+                return
+            try:
+                snapshot = ctypes.string_at(
+                    snapshot_pointer, _ADVERTISING_SNAPSHOT_SIZE
+                )
+                callback(_parse_advertising_snapshot(snapshot))
+            except Exception:
+                # 不能让 Python 异常越过 ctypes/native 回调边界。
+                return
+
+        self._advertising_callback = native_callback
+        try:
+            success = bool(register(native_callback))
+        except Exception:
+            self._advertising_callback = None
+            raise
+        if not success:
+            self._advertising_callback = None
+        return success
+
+    def unregister_advertising_notify(self) -> bool:
+        register = getattr(self._dll, "WCHBLERegisterAdvertisingNotify", None)
+        if not callable(register):
+            self._advertising_callback = None
+            return False
+        success = bool(register(None))
+        if success:
+            self._advertising_callback = None
+        return success
+
     def open_device(self, device_id: str, callback: Any) -> Any:
         @_ConnectionCallback
-        def native_callback(_handle: Any, status: int) -> None:
-            callback(bool(status))
+        def native_callback(native_handle: Any, status: int) -> None:
+            callback(native_handle, bool(status))
 
         handle = self._dll.WCHBLEOpenDevice(
             device_id.encode("mbcs"), False, native_callback
         )
         if not handle:
             raise TransportError("WCHBLEOpenDevice 返回空句柄")
+        self._connection_callbacks[_handle_key(handle)] = native_callback
+        return handle
+
+    def open_device_address(self, address: str, callback: Any) -> Any:
+        """按广播 MAC 连接，供 AdvertisingNotify 扫描结果使用。"""
+        open_by_address = getattr(self._dll, "WCHBLEOpenDeviceAddress", None)
+        if not callable(open_by_address):
+            raise TransportError("当前 WCH BLE 库不支持按地址连接")
+        if _MAC_ADDRESS.fullmatch(address) is None:
+            raise TransportError(f"无效的蓝牙地址：{address}")
+        # 新版 WCH DLL 的 PCHAR 参数并不是带冒号的显示字符串，而是回调结构中
+        # 原样取得的 6 字节 MAC；ctypes 会为 bytes 参数附加字符串终止零。
+        raw_address = bytes.fromhex(address.replace(":", ""))
+
+        @_ConnectionCallback
+        def native_callback(native_handle: Any, status: int) -> None:
+            callback(native_handle, bool(status))
+
+        handle = open_by_address(raw_address, False, native_callback)
+        if not handle:
+            raise TransportError("WCHBLEOpenDeviceAddress 返回空句柄")
         self._connection_callbacks[_handle_key(handle)] = native_callback
         return handle
 
@@ -271,7 +353,10 @@ class WchDllBinding:
         try:
             detail = get_last_error()
             raw_message = bytes(detail.message).split(b"\0", 1)[0]
-            message = raw_message.decode("mbcs", errors="replace")
+            try:
+                message = raw_message.decode("utf-8")
+            except UnicodeDecodeError:
+                message = raw_message.decode("mbcs", errors="replace")
             summary += (
                 f"；SDK={int(detail.code)}；OS=0x{int(detail.os_error):08X}；"
                 f"ATT=0x{int(detail.att_error):02X}"
@@ -298,6 +383,16 @@ class WchDllBinding:
             _ConnectionCallback,
         ]
         self._dll.WCHBLEOpenDevice.restype = ctypes.c_void_p
+        if hasattr(self._dll, "WCHBLERegisterAdvertisingNotify"):
+            self._dll.WCHBLERegisterAdvertisingNotify.argtypes = [ctypes.c_void_p]
+            self._dll.WCHBLERegisterAdvertisingNotify.restype = wintypes.BOOL
+        if hasattr(self._dll, "WCHBLEOpenDeviceAddress"):
+            self._dll.WCHBLEOpenDeviceAddress.argtypes = [
+                ctypes.c_char_p,
+                wintypes.BOOL,
+                _ConnectionCallback,
+            ]
+            self._dll.WCHBLEOpenDeviceAddress.restype = ctypes.c_void_p
         self._dll.WCHBLECloseDevice.argtypes = [ctypes.c_void_p]
         self._dll.WCHBLECloseDevice.restype = None
         self._dll.WCHBLEGetCharacteristicByUUID.argtypes = [
@@ -362,6 +457,66 @@ def _decode_native_string(value: Any) -> str:
     return raw.decode("mbcs", errors="replace")
 
 
+def _decode_advertising_name(value: bytes) -> str:
+    for encoding in ("utf-8", "mbcs"):
+        try:
+            return value.decode(encoding).rstrip("\0")
+        except UnicodeDecodeError:
+            continue
+    return value.decode("utf-8", errors="replace").rstrip("\0")
+
+
+def _parse_advertising_snapshot(snapshot: bytes | bytearray) -> WchScanRecord:
+    """解析新版 WCH DLL 广播回调的固定布局。
+
+    该布局由官方 BLEDebug V1.1 的调用方式及同版 DLL 实际回调验证：
+    MAC 位于 0，AD Data Section 数位于 56，每节为 type/length/256-byte data，
+    RSSI 位于 0x10F10。完整名称(0x09)优先于缩短名称(0x08)。
+    """
+    raw = bytes(snapshot)
+    if len(raw) < _ADVERTISING_SNAPSHOT_SIZE:
+        raise ValueError("WCH 广播回调数据长度不足")
+    mac = raw[:6]
+    if not any(mac):
+        raise ValueError("WCH 广播回调未包含有效 MAC")
+    address = ":".join(f"{part:02X}" for part in mac)
+    section_count = min(
+        int.from_bytes(
+            raw[
+                _ADVERTISING_SECTION_COUNT_OFFSET : _ADVERTISING_SECTION_COUNT_OFFSET
+                + 4
+            ],
+            "little",
+        ),
+        256,
+    )
+    names: dict[int, str] = {}
+    for index in range(section_count):
+        offset = _ADVERTISING_SECTION_OFFSET + index * _ADVERTISING_SECTION_STRIDE
+        if offset + 8 > _ADVERTISING_RSSI_OFFSET:
+            break
+        data_type = int.from_bytes(raw[offset : offset + 4], "little")
+        data_length = min(
+            int.from_bytes(raw[offset + 4 : offset + 8], "little"), 256
+        )
+        if data_type not in (0x08, 0x09) or not data_length:
+            continue
+        names[data_type] = _decode_advertising_name(
+            raw[offset + 8 : offset + 8 + data_length]
+        )
+    rssi = int.from_bytes(
+        raw[_ADVERTISING_RSSI_OFFSET : _ADVERTISING_RSSI_OFFSET + 4],
+        "little",
+        signed=True,
+    )
+    return WchScanRecord(
+        name=names.get(0x09) or names.get(0x08) or "",
+        device_id="",
+        address=address,
+        rssi=rssi,
+    )
+
+
 def _default_dll_path() -> Path:
     return Path(__file__).with_name("WCHBLEDLL_v15.dll")
 
@@ -369,6 +524,14 @@ def _default_dll_path() -> Path:
 def _handle_key(handle: Any) -> int:
     value = getattr(handle, "value", handle)
     return int(value)
+
+
+def _normalize_mac_address(address: Any) -> str:
+    value = str(address or "").strip().upper()
+    compact = re.sub(r"[:-]", "", value)
+    if re.fullmatch(r"[0-9A-F]{12}", compact):
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+    return value
 
 
 def _format_handle(handle: Any) -> str:
@@ -396,6 +559,9 @@ class WchDllTransport:
 
     backend_name = "WCH DLL"
     scan_is_continuous = True
+    # WCHBLEOpenDeviceAddress 依赖实时广播扫描建立的内部设备对象；连接句柄
+    # 建立后再注销广播回调。Bleak 等后端仍由界面在连接前停止扫描。
+    stop_scan_before_connect = False
     # 与已在目标设备验证可用的 Android Demo 一致：完整 20 字节帧，
     # 写入后静默等待再读取。6 字节第三方工具帧仅由控制器作备用。
     # 擦除是慢操作（50 个 4KB 块约 200KB），CH583 需数秒才能完成；
@@ -405,6 +571,15 @@ class WchDllTransport:
     erase_read_attempts = 20
     erase_read_retry_delay = 0.5
     prefer_compact_erase = False
+    # WCHBLEWriteCharacteristic 的无响应模式只表示数据已提交，并不保证外设
+    # 已消费。6 ms 间隔仍可能让 CH583 的 Flash 编程处理跟不上并静默丢包，
+    # 最终由 FLASH_ROM_VERIFY 返回非零状态，因此编程和校验都保守使用 12 ms。
+    ota_packet_delay = 0.012
+    program_packet_delay = 0.012
+    # 校验命令还会同步读取 Flash，处理时间不短于编程命令。WCH DLL 的“有响应”
+    # 模式仍会快速返回，不能作为可靠背压，因此保持 Android 的无响应写入方式。
+    verify_packet_delay = 0.012
+    device_id_resolution_attempts = 3
 
     def __init__(
         self,
@@ -417,6 +592,7 @@ class WchDllTransport:
     ) -> None:
         self._binding = binding or WchDllBinding(dll_path)
         self._scan_duration_ms = scan_duration_ms
+        self._initial_scan_duration_ms = min(1000, scan_duration_ms)
         self._disconnected_callback = disconnected_callback
         self._trace_callback = trace_callback
         self._handle: Any | None = None
@@ -424,13 +600,22 @@ class WchDllTransport:
         self._ota_properties: tuple[str, ...] = ()
         self._notify_characteristic: int | None = None
         self._operation_lock = asyncio.Lock()
+        self._scan_lock = asyncio.Lock()
         self._initialization_lock = asyncio.Lock()
+        self._shutdown_lock = asyncio.Lock()
         self._initialized = False
+        self._closed = False
         self._empty_read_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wch-ble")
         self._scan_active = False
         self._scan_task: asyncio.Task | None = None
         self._scan_callback: ScanCallback | None = None
+        self._native_scan_active = False
+        self._scan_event_loop: asyncio.AbstractEventLoop | None = None
+        self._scan_names: dict[str, str] = {}
+        self._connection_event_loop: asyncio.AbstractEventLoop | None = None
+        self._connection_generation = 0
+        self._pending_connection_state: tuple[int, bool] | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -453,18 +638,77 @@ class WchDllTransport:
         return "write" in self._ota_properties
 
     async def start_scan(self, callback: ScanCallback) -> None:
+        async with self._scan_lock:
+            await self._start_scan_locked(callback)
+
+    async def _start_scan_locked(self, callback: ScanCallback) -> None:
         await self._ensure_initialized()
         self._scan_callback = callback
         if self._scan_active:
             return
         self._scan_active = True
+        self._scan_event_loop = asyncio.get_running_loop()
+        self._scan_names.clear()
+        register_notify = getattr(self._binding, "register_advertising_notify", None)
+        supports_live_scan = getattr(self._binding, "supports_live_scan", None)
+        if supports_live_scan is None:
+            supports_live_scan = callable(register_notify) and callable(
+                getattr(self._binding, "open_device_address", None)
+            )
+        if supports_live_scan and callable(register_notify):
+            # 实时广播结构没有 Windows Device ID，部分设备也不在广播包内携带
+            # Local Name。先进行一次短枚举，用 Windows 缓存名称和 Device ID
+            # 丰富列表，再切换到实时广播持续更新 RSSI 和新设备。
+            try:
+                await self._scan_once(
+                    callback,
+                    scan_duration_ms=self._initial_scan_duration_ms,
+                )
+            except Exception as error:
+                self._trace(f"WCH DLL 初始名称解析失败，继续实时扫描：{error}")
+            try:
+                self._trace("WCH DLL 实时广播扫描开始")
+                self._native_scan_active = bool(
+                    await self._call_binding(
+                        register_notify, self._native_advertising_received
+                    )
+                )
+            except Exception as error:
+                self._trace(f"WCH DLL 实时广播扫描不可用，回退兼容扫描：{error}")
+                self._native_scan_active = False
+            if self._native_scan_active:
+                return
+            self._trace("WCH DLL 不支持实时广播扫描，使用兼容扫描")
         try:
-            await self._scan_once(callback)
+            await self._scan_once(
+                callback,
+                scan_duration_ms=self._initial_scan_duration_ms,
+            )
         except Exception:
             self._scan_active = False
             raise
         if self._scan_active:
             self._scan_task = asyncio.create_task(self._scan_loop())
+
+    def _native_advertising_received(self, record: WchScanRecord) -> None:
+        loop = self._scan_event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._dispatch_advertising_record, record)
+
+    def _dispatch_advertising_record(self, record: WchScanRecord) -> None:
+        if not self._scan_active or self.is_connected:
+            return
+        callback = self._scan_callback
+        if callback is None:
+            return
+        if record.name:
+            self._scan_names[record.address] = record.name
+        name = record.name or self._scan_names.get(record.address, "")
+        callback(
+            WchDevice(name, record.address, record.device_id),
+            WchAdvertisement(name or None, record.rssi),
+        )
 
     async def _scan_loop(self) -> None:
         try:
@@ -488,24 +732,47 @@ class WchDllTransport:
             if asyncio.current_task() is self._scan_task:
                 self._scan_task = None
 
-    async def _scan_once(self, callback: ScanCallback) -> None:
-        self._trace(f"WCH DLL 扫描开始：时长={self._scan_duration_ms} ms")
+    async def _scan_once(
+        self,
+        callback: ScanCallback,
+        *,
+        scan_duration_ms: int | None = None,
+    ) -> None:
+        duration_ms = scan_duration_ms or self._scan_duration_ms
+        self._trace(f"WCH DLL 扫描开始：时长={duration_ms} ms")
         started = perf_counter()
         records = await self._call_binding(
-            self._binding.enumerate_devices, self._scan_duration_ms
+            self._binding.enumerate_devices, duration_ms
         )
         self._trace(
             f"WCH DLL 扫描完成：设备数={len(records)}；"
             f"耗时={self._elapsed_ms(started):.1f} ms"
         )
         for record in records:
+            if record.name:
+                self._scan_names[record.address] = record.name
             callback(
                 WchDevice(record.name, record.address, record.device_id),
                 WchAdvertisement(record.name or None, record.rssi),
             )
 
     async def stop_scan(self) -> None:
+        async with self._scan_lock:
+            await self._stop_scan_locked()
+
+    async def _stop_scan_locked(self) -> None:
         self._scan_active = False
+        if self._native_scan_active:
+            unregister_notify = getattr(
+                self._binding, "unregister_advertising_notify", None
+            )
+            if callable(unregister_notify):
+                success = bool(await self._call_binding(unregister_notify))
+                if not success:
+                    raise TransportError("注销实时广播扫描失败，可重试停止扫描")
+            self._native_scan_active = False
+            self._trace("WCH DLL 实时广播扫描已停止")
+        self._scan_event_loop = None
         task = self._scan_task
         self._scan_task = None
         if task is None or task is asyncio.current_task():
@@ -526,22 +793,42 @@ class WchDllTransport:
                 f"名称={device.name or '未知设备'}；设备ID={device.device_id}"
             )
             started = perf_counter()
+            self._connection_event_loop = asyncio.get_running_loop()
+            def new_connection_callback() -> tuple[int, Any]:
+                self._connection_generation += 1
+                attempt_generation = self._connection_generation
+                self._pending_connection_state = None
+                callback = lambda _handle, connected: self._native_connection_changed(
+                    attempt_generation, connected
+                )
+                return attempt_generation, callback
+
             try:
-                handle = await self._call_binding(
-                    self._binding.open_device,
-                    device.device_id,
-                    self._native_connection_changed,
+                handle, generation = await self._open_device_with_fallback(
+                    device, new_connection_callback
                 )
             except Exception as error:
                 raise TransportError(f"WCH DLL 连接设备失败：{error}") from error
             if not handle:
                 raise TransportError("WCH DLL 连接设备失败")
             self._handle = handle
-            self._trace(
-                f"WCH DLL 连接句柄已建立：句柄={_format_handle(handle)}；"
-                f"耗时={self._elapsed_ms(started):.1f} ms"
-            )
+            # 处理 WCHBLEOpenDevice 返回前已经送达的断开事件。
+            await asyncio.sleep(0)
+            if self._pending_connection_state == (generation, False):
+                await self._call_binding(self._binding.close_device, handle)
+                self._handle = None
+                raise TransportError("连接建立期间设备已断开")
+            self._pending_connection_state = None
             try:
+                # 地址连接必须借助实时广播缓存；句柄一旦建立即可停止扫描，避免
+                # 后续服务发现和 OTA 通信继续受到扫描活动影响。停止失败也属于
+                # 连接初始化失败，必须关闭刚建立的句柄。
+                if self._scan_active:
+                    await self.stop_scan()
+                self._trace(
+                    f"WCH DLL 连接句柄已建立：句柄={_format_handle(handle)}；"
+                    f"耗时={self._elapsed_ms(started):.1f} ms"
+                )
                 characteristic_started = perf_counter()
                 has_ota = await self._call_binding(
                     self._binding.has_ota_characteristic, handle
@@ -602,6 +889,8 @@ class WchDllTransport:
                     f"无响应写入上限={self.max_write_without_response_size}；"
                     f"读取MTU耗时={self._elapsed_ms(mtu_started):.1f} ms"
                 )
+                if self._handle is not handle:
+                    raise TransportError("连接初始化期间设备已断开")
             except Exception:
                 await self._call_binding(self._binding.close_device, handle)
                 self._handle = None
@@ -609,6 +898,93 @@ class WchDllTransport:
                 self._ota_properties = ()
                 self._notify_characteristic = None
                 raise
+
+    async def _open_device_with_fallback(
+        self, device: WchDevice, connection_callback_factory: Any
+    ) -> tuple[Any, int]:
+        address = _normalize_mac_address(device.address)
+        errors: list[str] = []
+        if device.device_id:
+            try:
+                generation, connection_callback = connection_callback_factory()
+                handle = await self._call_binding(
+                    self._binding.open_device, device.device_id, connection_callback
+                )
+                if not handle:
+                    raise TransportError("WCHBLEOpenDevice 返回空句柄")
+                return handle, generation
+            except Exception as device_id_error:
+                errors.append(f"Device ID 连接失败：{device_id_error}")
+                self._trace(
+                    "WCH DLL Device ID 连接失败，准备兼容恢复："
+                    f"{device_id_error}"
+                )
+
+        open_by_address = getattr(self._binding, "open_device_address", None)
+        # WCHBLEOpenDeviceAddress 依赖实时广播建立的内部缓存。仅在实时扫描仍
+        # 活跃时尝试，避免兼容扫描结果直接按地址打开并稳定返回空句柄。
+        if callable(open_by_address) and (
+            not device.device_id or self._native_scan_active
+        ):
+            try:
+                generation, connection_callback = connection_callback_factory()
+                handle = await self._call_binding(
+                    open_by_address, address, connection_callback
+                )
+                if not handle:
+                    raise TransportError("WCHBLEOpenDeviceAddress 返回空句柄")
+                if device.device_id:
+                    self._trace("WCH DLL 已从 Device ID 连接回退为 MAC 地址连接")
+                return handle, generation
+            except Exception as address_error:
+                errors.append(f"MAC 地址连接失败：{address_error}")
+
+        # 地址连接不可用或失败时，结束扫描并重新枚举，取得当前电脑、当前
+        # 蓝牙适配器生成的最新 Windows Device ID 后再尝试一次。
+        if self._scan_active or self._native_scan_active:
+            try:
+                await self.stop_scan()
+            except Exception as stop_error:
+                errors.append(f"停止扫描失败：{stop_error}")
+        resolved = None
+        for attempt in range(1, self.device_id_resolution_attempts + 1):
+            records = await self._call_binding(
+                self._binding.enumerate_devices, self._scan_duration_ms
+            )
+            resolved = next(
+                (
+                    record
+                    for record in records
+                    if _normalize_mac_address(record.address) == address
+                    and record.device_id
+                ),
+                None,
+            )
+            if resolved is not None:
+                break
+            self._trace(
+                "WCH DLL 兼容扫描暂未解析目标 Device ID："
+                f"第 {attempt}/{self.device_id_resolution_attempts} 次"
+            )
+        if resolved is None or not resolved.device_id:
+            errors.append("兼容扫描未找到设备的最新 Device ID")
+            raise TransportError("；".join(errors))
+        try:
+            self._trace(
+                f"WCH DLL 使用重新扫描取得的 Device ID 重试：{resolved.device_id}"
+            )
+            generation, connection_callback = connection_callback_factory()
+            handle = await self._call_binding(
+                self._binding.open_device,
+                resolved.device_id,
+                connection_callback,
+            )
+            if not handle:
+                raise TransportError("WCHBLEOpenDevice 返回空句柄")
+            return handle, generation
+        except Exception as refreshed_id_error:
+            errors.append(f"最新 Device ID 连接失败：{refreshed_id_error}")
+            raise TransportError("；".join(errors)) from refreshed_id_error
 
     async def write_ota(self, payload: bytes, *, response: bool = False) -> None:
         handle = self._require_handle()
@@ -704,6 +1080,8 @@ class WchDllTransport:
             handle = self._handle
             if handle is None:
                 return
+            self._connection_generation += 1
+            self._pending_connection_state = None
             self._trace(f"WCH DLL 主动断开开始：句柄={_format_handle(handle)}")
             self._handle = None
             self._mtu = 23
@@ -724,14 +1102,48 @@ class WchDllTransport:
                 raise TransportError(f"WCH DLL 断开设备失败：{error}") from error
             self._trace(f"WCH DLL 主动断开完成：耗时={self._elapsed_ms(started):.1f} ms")
 
+    async def shutdown(self) -> None:
+        """停止后台活动并释放本后端拥有的执行器。"""
+        async with self._shutdown_lock:
+            if self._closed:
+                return
+            errors: list[str] = []
+            try:
+                await self.stop_scan()
+            except Exception as error:
+                errors.append(f"停止扫描失败：{error}")
+            try:
+                await self.disconnect()
+            except Exception as error:
+                errors.append(f"断开设备失败：{error}")
+            self._closed = True
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            if errors:
+                raise TransportError("；".join(errors))
+
     def _require_handle(self) -> Any:
         if self._handle is None:
             raise TransportError("蓝牙设备尚未连接")
         return self._handle
 
-    def _native_connection_changed(self, connected: bool) -> None:
+    def _native_connection_changed(self, generation: int, connected: bool) -> None:
         self._trace(f"WCH DLL 原生连接事件：状态={'已连接' if connected else '已断开'}")
-        if connected or self._handle is None:
+        loop = self._connection_event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(
+            self._apply_native_connection_changed, generation, connected
+        )
+
+    def _apply_native_connection_changed(
+        self, generation: int, connected: bool
+    ) -> None:
+        if generation != self._connection_generation:
+            return
+        if self._handle is None:
+            self._pending_connection_state = (generation, connected)
+            return
+        if connected:
             return
         self._handle = None
         self._mtu = 23
@@ -758,6 +1170,8 @@ class WchDllTransport:
             self._trace(f"WCH DLL 初始化完成：耗时={self._elapsed_ms(started):.1f} ms")
 
     async def _call_binding(self, function: Any, *args: Any) -> Any:
+        if self._closed:
+            raise TransportError("WCH BLE 后端已经关闭")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, function, *args)
 

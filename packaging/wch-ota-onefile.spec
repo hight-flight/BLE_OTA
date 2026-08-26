@@ -26,7 +26,6 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # qasync 会动态探测多种 Qt 绑定；发行包只允许收集选定的 PySide6。
     excludes=['PyQt5', 'PyQt6', 'PySide2'],
     noarchive=False,
     optimize=0,
@@ -36,8 +35,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='WCH-BLE-OTA',
     debug=False,
     bootloader_ignore_signals=False,
@@ -49,15 +49,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    exclude_binaries=False,
     icon=str(project_root / 'src/wch_ota/BLE.ico'),
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name='WCH-BLE-OTA',
 )
