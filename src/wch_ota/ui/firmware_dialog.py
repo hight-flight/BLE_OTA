@@ -1,20 +1,57 @@
 """固件选择控件。"""
 
-from PySide6.QtCore import QRegularExpression
-from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtCore import QRegularExpression, Signal
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QRegularExpressionValidator
 from PySide6.QtWidgets import (
-    QButtonGroup, QFormLayout, QGroupBox, QHBoxLayout, QLineEdit, QPushButton,
-    QSizePolicy, QWidget,
+    QButtonGroup, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLineEdit,
+    QPushButton, QSizePolicy, QWidget,
 )
 
 from wch_ota.domain.models import ImageType
 
 
+class FirmwarePathComboBox(QComboBox):
+    """支持固件文件拖放的只读路径下拉框。"""
+
+    file_dropped = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setAcceptDrops(False)
+        self.setAcceptDrops(True)
+
+    def isReadOnly(self) -> bool:
+        return self.lineEdit().isReadOnly()
+
+    def add_recent_path(self, path: str) -> None:
+        index = self.findText(path)
+        if index >= 0:
+            self.removeItem(index)
+        self.insertItem(0, path)
+        self.setCurrentIndex(0)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        if not urls or not urls[0].isLocalFile():
+            event.ignore()
+            return
+        self.file_dropped.emit(urls[0].toLocalFile())
+        event.acceptProposedAction()
+
+
 class FirmwarePanel(QGroupBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("固件", parent)
-        self.path_edit = QLineEdit()
-        self.path_edit.setReadOnly(True)
+        self.path_edit = FirmwarePathComboBox()
         self.browse_button = QPushButton("浏览…")
         self.browse_button.setProperty("compact", True)
         self.browse_button.setMaximumWidth(64)

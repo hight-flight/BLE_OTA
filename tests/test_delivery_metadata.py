@@ -18,7 +18,7 @@ def test_readme_and_project_metadata_use_pyside6_bleak_stack() -> None:
     assert "pyinstaller>=6" in metadata["project"]["optional-dependencies"]["dev"]
     assert metadata["tool"]["pytest"]["ini_options"]["qt_api"] == "pyside6"
     assert metadata["project"]["scripts"]["wch-ota"] == "wch_ota.__main__:main"
-    assert metadata["project"]["version"] == "1.1.0"
+    assert metadata["project"]["version"] == "1.1.1"
     assert metadata["tool"]["setuptools"]["package-data"]["wch_ota.ble"] == [
         "WCHBLEDLL*.dll"
     ]

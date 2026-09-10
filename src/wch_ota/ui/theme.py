@@ -102,6 +102,7 @@ QPushButton[actionButton="true"] {
 }
 
 QLineEdit,
+QComboBox,
 QPlainTextEdit,
 QTableView {
     background-color: #FFFFFF;
@@ -111,12 +112,14 @@ QTableView {
     border-radius: 6px;
 }
 
-QLineEdit {
+QLineEdit,
+QComboBox {
     min-height: 24px;
     padding: 1px 6px;
 }
 
-QLineEdit:disabled {
+QLineEdit:disabled,
+QComboBox:disabled {
     color: #949DA6;
     background-color: #E9EDF1;
     border-color: #D2D8DE;

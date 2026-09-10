@@ -4,8 +4,9 @@ import inspect
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHeaderView
+from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import QApplication, QHeaderView
 
 from wch_ota.application.ota_events import OtaEvent, UpgradeStage, UpgradeStatus
 from wch_ota.ble.transport import TransportError
@@ -116,6 +117,40 @@ def test_window_contains_complete_controls_and_initial_state(window):
     assert widget.device_view.columnWidth(1) == original_width + 20
 
 
+def test_firmware_field_accepts_drops_and_selects_recent_paths(window, tmp_path):
+    widget, _, _ = window
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.hex"
+    dropped = tmp_path / "dropped.bin"
+    first.write_bytes(b"\x01")
+    second.write_text(":00000001FF\n", encoding="ascii")
+    dropped.write_bytes(b"\x02")
+
+    widget.set_firmware_path(first)
+    widget.set_firmware_path(second)
+
+    assert widget.firmware_path.itemText(0) == str(second)
+    assert widget.firmware_path.itemText(1) == str(first)
+    widget.firmware_path.setCurrentIndex(1)
+    assert widget.firmware_path.currentText() == str(first)
+
+    mime_data = QMimeData()
+    mime_data.setUrls([QUrl.fromLocalFile(str(dropped))])
+    drag_enter_event = QDragEnterEvent(
+        QPointF(4, 4).toPoint(), Qt.CopyAction, mime_data, Qt.LeftButton, Qt.NoModifier
+    )
+    QApplication.sendEvent(widget.firmware_path, drag_enter_event)
+    drop_event = QDropEvent(
+        QPointF(4, 4), Qt.CopyAction, mime_data, Qt.LeftButton, Qt.NoModifier
+    )
+    QApplication.sendEvent(widget.firmware_path, drop_event)
+
+    assert drag_enter_event.isAccepted()
+    assert drop_event.isAccepted()
+    assert widget.firmware_path.currentText() == str(dropped)
+    assert widget.firmware_path.itemText(0) == str(dropped)
+
+
 def test_reference_layout_compacts_controls_and_gives_log_more_space(window):
     widget, _, _ = window
 
@@ -144,7 +179,7 @@ def test_reference_layout_compacts_controls_and_gives_log_more_space(window):
     assert widget.log_panel.isAncestorOf(widget.export_button)
     assert widget.log_panel.isAncestorOf(widget.clear_log_button)
     assert not widget.statusBar().isSizeGripEnabled()
-    assert widget.version_label.text() == "V1.1.0"
+    assert widget.version_label.text() == "V1.1.1"
     assert widget.statusBar().isAncestorOf(widget.version_label)
 
 

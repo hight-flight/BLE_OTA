@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHeaderView, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
@@ -30,6 +30,8 @@ _TARGET_IMAGE = {
     ImageType.A: ImageType.B,
     ImageType.B: ImageType.A,
 }
+_FIRMWARE_HISTORY_KEY = "recentFirmwarePaths"
+_FIRMWARE_HISTORY_LIMIT = 10
 
 
 class MainWindow(QMainWindow):
@@ -63,6 +65,7 @@ class MainWindow(QMainWindow):
         self._upgrade_task: asyncio.Task | None = None
         self._shutdown_complete = False
         self._transport_cleanup_complete = False
+        self._settings = QSettings("WCH", "WCH BLE OTA")
         self.setWindowTitle("WCH BLE OTA 工具")
         self.resize(1200, 800)
         self._build_ui()
@@ -78,6 +81,7 @@ class MainWindow(QMainWindow):
         self.ota_event_received.connect(self._on_ota_event)
         self.transport_disconnected.connect(self._on_transport_disconnected)
         self.transport_trace_received.connect(self._on_transport_trace)
+        self._restore_firmware_history()
         self._device_expiry_timer = QTimer(self)
         self._device_expiry_timer.setInterval(2000)
         self._device_expiry_timer.timeout.connect(self._prune_stale_devices)
@@ -255,6 +259,8 @@ class MainWindow(QMainWindow):
         self.reconnect_button.clicked.connect(self._reconnect_slot)
         self.info_button.clicked.connect(self._info_slot)
         self.browse_button.clicked.connect(self.browse_firmware)
+        self.firmware_path.currentTextChanged.connect(self._on_firmware_path_changed)
+        self.firmware_path.file_dropped.connect(self.set_firmware_path)
         self.erase_address.editingFinished.connect(self._validate_firmware)
         for image_button in (
             self.image_a_button,
@@ -643,10 +649,35 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() not in {".bin", ".hex"}:
             self._append_log("仅支持 BIN 或 HEX 固件文件")
             return False
-        self.firmware_path.setText(str(path))
+        self.firmware_path.add_recent_path(str(path))
+        self._save_firmware_history()
         self._firmware_cache_key = None
         self._validate_firmware()
         return True
+
+    @Slot(str)
+    def _on_firmware_path_changed(self, _path: str) -> None:
+        self._firmware_cache_key = None
+        self._validate_firmware()
+
+    def _restore_firmware_history(self) -> None:
+        saved_paths = self._settings.value(_FIRMWARE_HISTORY_KEY, [])
+        if isinstance(saved_paths, str):
+            saved_paths = [saved_paths]
+        if not isinstance(saved_paths, list):
+            return
+        for path in reversed(saved_paths[:_FIRMWARE_HISTORY_LIMIT]):
+            if Path(path).suffix.lower() in {".bin", ".hex"}:
+                self.firmware_path.addItem(path)
+        if self.firmware_path.count():
+            self.firmware_path.setCurrentIndex(-1)
+
+    def _save_firmware_history(self) -> None:
+        history = [
+            self.firmware_path.itemText(index)
+            for index in range(min(self.firmware_path.count(), _FIRMWARE_HISTORY_LIMIT))
+        ]
+        self._settings.setValue(_FIRMWARE_HISTORY_KEY, history)
 
     @Slot()
     def _validate_firmware(self) -> None:
@@ -654,7 +685,7 @@ class MainWindow(QMainWindow):
         self._refresh_controls()
 
     def _get_validated_firmware(self):
-        path = Path(self.firmware_path.text())
+        path = Path(self.firmware_path.currentText())
         suffix = path.suffix.lower()
         target_image = self.firmware_panel.target_image()
         erase_address = None
@@ -699,7 +730,7 @@ class MainWindow(QMainWindow):
         if self._upgrade_task is not None and not self._upgrade_task.done():
             self._append_log("升级操作正在进行中")
             return
-        path = Path(self.firmware_path.text())
+        path = Path(self.firmware_path.currentText())
         owner = False
         try:
             firmware = self._get_validated_firmware()
@@ -785,7 +816,7 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(idle)
         self.erase_address.setEnabled(
             idle
-            and self.firmware_path.text().lower().endswith(".bin")
+            and self.firmware_path.currentText().lower().endswith(".bin")
             and (
                 self.current_info is None
                 or self.current_info.chip is not ChipType.CH579
