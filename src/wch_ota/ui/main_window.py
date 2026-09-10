@@ -40,7 +40,9 @@ class MainWindow(QMainWindow):
     transport_disconnected = Signal(object)
     transport_trace_received = Signal(str)
 
-    def __init__(self, *, transport: Any, controller: Any) -> None:
+    def __init__(
+        self, *, transport: Any, controller: Any, settings: QSettings | None = None
+    ) -> None:
         super().__init__()
         self.transport = transport
         self.controller = controller
@@ -65,7 +67,9 @@ class MainWindow(QMainWindow):
         self._upgrade_task: asyncio.Task | None = None
         self._shutdown_complete = False
         self._transport_cleanup_complete = False
-        self._settings = QSettings("WCH", "WCH BLE OTA")
+        self._settings = (
+            settings if settings is not None else QSettings("WCH", "WCH BLE OTA")
+        )
         self.setWindowTitle("WCH BLE OTA 工具")
         self.resize(1200, 800)
         self._build_ui()
@@ -666,7 +670,7 @@ class MainWindow(QMainWindow):
             saved_paths = [saved_paths]
         if not isinstance(saved_paths, list):
             return
-        for path in reversed(saved_paths[:_FIRMWARE_HISTORY_LIMIT]):
+        for path in saved_paths[:_FIRMWARE_HISTORY_LIMIT]:
             if Path(path).suffix.lower() in {".bin", ".hex"}:
                 self.firmware_path.addItem(path)
         if self.firmware_path.count():

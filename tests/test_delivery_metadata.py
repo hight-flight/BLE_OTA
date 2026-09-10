@@ -82,7 +82,10 @@ def test_pyinstaller_entrypoint_uses_package_absolute_imports() -> None:
 def test_gitignore_excludes_local_build_and_test_artifacts() -> None:
     ignored = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
 
-    for pattern in (".venv/", "build/", "dist/", "*.egg-info/", ".pytest_cache/"):
+    for pattern in (
+        ".venv/", "build/", "dist/", "*.egg-info/", ".pytest_cache/",
+        ".test-run-*/", ".test-version-*/", ".test-fix-*/",
+    ):
         assert pattern in ignored
 
 

@@ -4,7 +4,7 @@ import inspect
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QHeaderView
 
@@ -149,6 +149,28 @@ def test_firmware_field_accepts_drops_and_selects_recent_paths(window, tmp_path)
     assert drop_event.isAccepted()
     assert widget.firmware_path.currentText() == str(dropped)
     assert widget.firmware_path.itemText(0) == str(dropped)
+
+
+def test_firmware_history_is_restored_with_a_ten_path_limit(qtbot, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    paths = [str(tmp_path / f"firmware-{index}.bin") for index in range(11)]
+    first = MainWindow(
+        transport=FakeTransport(), controller=FakeController(), settings=settings
+    )
+    qtbot.addWidget(first)
+    for path in paths:
+        first.set_firmware_path(path)
+    settings.sync()
+
+    restored = MainWindow(
+        transport=FakeTransport(), controller=FakeController(), settings=settings
+    )
+    qtbot.addWidget(restored)
+
+    assert restored.firmware_path.count() == 10
+    assert restored.firmware_path.itemText(0) == paths[-1]
+    assert restored.firmware_path.itemText(9) == paths[1]
+    assert restored.firmware_path.currentText() == ""
 
 
 def test_reference_layout_compacts_controls_and_gives_log_more_space(window):
